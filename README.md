@@ -33,4 +33,6 @@ The round mic button (bottom right) lets you add tasks, mark things done, switch
 
 - Needs `GEMINI_API_KEY` in `.env` (server only, never commit it). Run with `npm run dev` (this starts `server.ts`).
 - The AI routes only accept requests from signed-in users and are limited to 30 requests per minute per user.
-- On Vercel the static site has no `server.ts`, so only the built-in parser works there. Host the server elsewhere or ask for a Vercel functions version to get the Gemini-powered parsing online.
+- Vercel: `api/transcribe-audio.ts` and `api/parse-voice-command.ts` are Vercel functions that share `lib/voice.ts` with `server.ts`. In Vercel > Settings > Environment Variables add `GEMINI_API_KEY` and the `VITE_FIREBASE_*` values, then redeploy.
+- Optional `GEMINI_MODELS` (comma separated, default `gemini-3.1-flash-lite,gemini-2.5-flash`) if a model name changes.
+- Shortcut: Alt+V starts/stops the mic. After you speak and pause for about 2 seconds the command runs by itself.

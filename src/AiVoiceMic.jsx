@@ -1,4 +1,15 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { auth } from './firebase';
+
+// Sends the signed-in user's Firebase token so the server can verify who is calling
+async function authHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  try {
+    const t = await auth.currentUser?.getIdToken();
+    if (t) h.Authorization = 'Bearer ' + t;
+  } catch {}
+  return h;
+}
 
 // Optional Web Speech Synthesis for spoken confirmation
 function speakFeedback(text) {
@@ -280,6 +291,7 @@ export default function AiVoiceMic({
   const [hasReceivedSound, setHasReceivedSound] = useState(false);
   const [silenceDuration, setSilenceDuration] = useState(0);
   const [isTestingMic, setIsTestingMic] = useState(false);
+  const [sttStatus, setSttStatus] = useState('');
 
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
@@ -306,6 +318,10 @@ export default function AiVoiceMic({
   const isListeningRef = useRef(false);
   const isTranscribingRef = useRef(false);
   const liveTranscribeTimerRef = useRef(null);
+  const lastSrResultAtRef = useRef(0); // when browser speech last produced text
+  const serverSttBlockedRef = useRef(false); // /api/transcribe-audio unreachable or rate limited
+  const heardSpeechRef = useRef(false); // real speech heard in this recording
+  const autoFinishRef = useRef(null); // always points at the latest handleDoneAndRun
 
   // Load and enumerate all available microphone devices
   const loadAudioDevices = async () => {
@@ -372,6 +388,9 @@ export default function AiVoiceMic({
     liveTranscribeTimerRef.current = setTimeout(async () => {
       liveTranscribeTimerRef.current = null;
       if (isTranscribingRef.current || recordedSamplesRef.current.length < 8) return;
+      if (serverSttBlockedRef.current) return;
+      // Browser speech is already writing text: don't spend server quota
+      if (Date.now() - lastSrResultAtRef.current < 4000) return;
       isTranscribingRef.current = true;
       try {
         let totalLength = 0;
@@ -397,24 +416,35 @@ export default function AiVoiceMic({
 
         const res = await fetch('/api/transcribe-audio', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: await authHeaders(),
           body: JSON.stringify({ audioBase64: b64, mimeType: 'audio/wav' }),
         });
 
-        if (res.ok) {
+        const ct = res.headers.get('content-type') || '';
+        if (res.ok && ct.includes('application/json')) {
           const resData = await res.json();
           if (resData.success && resData.transcript) {
-            console.log('[Live Transcribe] Actively written text:', resData.transcript);
             setTranscript(resData.transcript);
             setManualCmd(resData.transcript);
+            setSttStatus('');
           }
+        } else if (res.status === 429) {
+          serverSttBlockedRef.current = true;
+          setTimeout(() => { serverSttBlockedRef.current = false; }, 30000);
+          setSttStatus('Too many requests. Live text paused; it will still transcribe when you press Done.');
+        } else if (res.status === 401) {
+          setSttStatus('Please sign in again, then retry the mic.');
+        } else {
+          // 404 / HTML page = the voice server is not deployed here
+          serverSttBlockedRef.current = true;
+          setSttStatus('Voice server not reachable (needs /api on your host). Live text is off.');
         }
       } catch (err) {
         console.warn('Live transcribe check notice:', err);
       } finally {
         isTranscribingRef.current = false;
       }
-    }, 1100);
+    }, 3500);
   };
 
   // Real-time audio analyzer using Web Audio API + PCM sample capture
@@ -483,6 +513,7 @@ export default function AiVoiceMic({
         setAudioLevel(level);
 
         if (level > 4) {
+          heardSpeechRef.current = true;
           setVoiceDetected(true);
           setHasReceivedSound(true);
           silenceCounterRef.current = 0;
@@ -490,6 +521,11 @@ export default function AiVoiceMic({
         } else {
           setVoiceDetected(false);
           silenceCounterRef.current += 1;
+          // Wispr-style hands-free: ~1.8s of quiet after you spoke = run it
+          if (heardSpeechRef.current && isListeningRef.current && silenceCounterRef.current === 110) {
+            heardSpeechRef.current = false;
+            if (autoFinishRef.current) autoFinishRef.current();
+          }
           if (silenceCounterRef.current % 30 === 0) {
             setSilenceDuration((prev) => prev + 0.5);
           }
@@ -620,6 +656,8 @@ export default function AiVoiceMic({
         }
         const text = full.trim();
         if (text) {
+          lastSrResultAtRef.current = Date.now();
+          setSttStatus('');
           setTranscript(text);
           setManualCmd(text);
         }
@@ -629,6 +667,12 @@ export default function AiVoiceMic({
         console.warn('SpeechRecognition notice:', event.error);
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please allow mic permissions in browser.');
+        } else if (event.error === 'audio-capture') {
+          setSttStatus("Browser speech can't open your mic. Set your headset as the default mic (Windows Sound settings and Chrome's mic setting).");
+        } else if (event.error === 'network') {
+          setSttStatus("Browser speech service unreachable (needs internet; Brave blocks it). Audio is still recorded and will be transcribed on Done.");
+        } else if (event.error === 'language-not-supported') {
+          setSttStatus('Browser speech does not support this language. Audio will be transcribed on Done.');
         }
       };
 
@@ -686,18 +730,20 @@ export default function AiVoiceMic({
       }
 
       let commandData = null;
+      let serverReached = false;
 
       // 1. Try server-side Gemini AI parser first
       try {
         const res = await fetch('/api/parse-voice-command', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: await authHeaders(),
           body: JSON.stringify(payload),
         });
 
         const contentType = res.headers.get('content-type') || '';
         if (contentType.includes('application/json')) {
           const resData = await res.json();
+          serverReached = true;
           if (resData && resData.success && resData.data) {
             commandData = resData.data;
           }
@@ -714,7 +760,7 @@ export default function AiVoiceMic({
       }
 
       if (!commandData || commandData.action === 'feedback_only') {
-        const msg = commandData?.feedback || "Could not hear clear speech. Try speaking closer to mic or pick a quick command below.";
+        const msg = commandData?.feedback || (!serverReached && !textToProcess ? 'Could not reach the voice server, so I could not transcribe. Type the command below or use a quick button.' : null) || "Could not hear clear speech. Try speaking closer to mic or pick a quick command below.";
         setFeedback({ message: msg });
         speakFeedback(msg);
         return;
@@ -907,7 +953,7 @@ export default function AiVoiceMic({
 
     stopAudioVisualizer();
     setListening(false);
-    const cmd = (overrideText || transcript || manualCmd).trim();
+    const cmd = ((typeof overrideText === 'string' && overrideText) || transcript || manualCmd || '').trim();
     executeVoiceCommand(cmd, finalWavBlob);
   };
 
@@ -927,6 +973,10 @@ export default function AiVoiceMic({
     // Start listening
     setTranscript('');
     setManualCmd('');
+    setSttStatus('');
+    heardSpeechRef.current = false;
+    lastSrResultAtRef.current = 0;
+    serverSttBlockedRef.current = false;
 
     // ALWAYS start MediaRecorder on the selected headset/microphone stream
     startMediaRecorder();
@@ -940,6 +990,22 @@ export default function AiVoiceMic({
       }
     }
   };
+
+  // Keep latest handlers reachable from the audio loop and the keyboard shortcut
+  autoFinishRef.current = () => handleDoneAndRun();
+  const toggleRef = useRef(null);
+  toggleRef.current = toggleListening;
+  useEffect(() => {
+    // Alt+V starts/stops the mic from anywhere on the page
+    const onKey = (e) => {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyV') {
+        e.preventDefault();
+        if (toggleRef.current) toggleRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   return (
     <div className="ai-voice-floating-container">
@@ -1052,7 +1118,7 @@ export default function AiVoiceMic({
               {transcript ||
                 manualCmd ||
                 (voiceDetected
-                  ? '🟢 Hearing your headset voice... Transcribing...'
+                  ? (sttStatus || '🟢 Hearing your voice… text appears as it is recognised')
                   : 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…')}
               <span className="ai-blinking-cursor">|</span>
             </div>

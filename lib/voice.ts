@@ -1,75 +1,51 @@
-import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
-import dotenv from 'dotenv';
-import path from 'path';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
-import { transcribeAudio, parseVoiceCommand } from './lib/voice.js';
+import path from 'path';
 
-dotenv.config({ override: true });
+// Shared by server.ts (local / self-hosted) and api/*.ts (Vercel functions).
+const MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-flash-lite,gemini-2.5-flash').split(',').map((m) => m.trim()).filter(Boolean);
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const fbConfig = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf8'));
+export const getAiClient = () => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY environment variable is not set');
+  return new GoogleGenAI({ apiKey });
+};
 
-const app = express();
-
-const portFlagIdx = process.argv.indexOf('--port') !== -1 ? process.argv.indexOf('--port') : process.argv.indexOf('-p');
-const parsedArgPort = portFlagIdx !== -1 && process.argv[portFlagIdx + 1] ? parseInt(process.argv[portFlagIdx + 1], 10) : undefined;
-const PORT = parsedArgPort || (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
-const HOST = '0.0.0.0';
-
-app.use(express.json({ limit: '15mb' }));
-
-// Only signed-in planner users may call the AI routes (protects the Gemini quota).
-// The browser sends its Firebase ID token; we verify it with Firebase and rate-limit per user.
-const hits = new Map<string, number[]>();
-async function requireUser(req: express.Request, res: express.Response, next: express.NextFunction) {
+function firebaseApiKey(): string {
+  if (process.env.VITE_FIREBASE_API_KEY) return process.env.VITE_FIREBASE_API_KEY;
   try {
-    const header = req.headers.authorization || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-    if (!token) return res.status(401).json({ error: 'Sign in required' });
-    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${fbConfig.apiKey}`, {
+    const p = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    return JSON.parse(fs.readFileSync(p, 'utf8')).apiKey || '';
+  } catch {
+    return '';
+  }
+}
+
+// Verify the Firebase ID token and rate-limit per user (30 requests / minute).
+const hits = new Map<string, number[]>();
+export async function verifyUser(authHeader: string | undefined): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  try {
+    const token = (authHeader || '').startsWith('Bearer ') ? (authHeader as string).slice(7) : '';
+    if (!token) return { ok: false, status: 401, error: 'Sign in required' };
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${firebaseApiKey()}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ idToken: token }),
     });
-    if (!r.ok) return res.status(401).json({ error: 'Invalid or expired sign-in' });
+    if (!r.ok) return { ok: false, status: 401, error: 'Invalid or expired sign-in' };
     const data: any = await r.json();
     const uid = data?.users?.[0]?.localId;
-    if (!uid) return res.status(401).json({ error: 'Invalid sign-in' });
+    if (!uid) return { ok: false, status: 401, error: 'Invalid sign-in' };
     const now = Date.now();
     const recent = (hits.get(uid) || []).filter((t) => now - t < 60_000);
-    if (recent.length >= 30) return res.status(429).json({ error: 'Too many requests. Wait a minute and try again.' });
+    if (recent.length >= 30) return { ok: false, status: 429, error: 'Too many requests. Wait a minute and try again.' };
     recent.push(now);
     hits.set(uid, recent);
-    next();
-  } catch (e) {
-    return res.status(500).json({ error: 'Could not verify sign-in' });
+    return { ok: true };
+  } catch {
+    return { ok: false, status: 500, error: 'Could not verify sign-in' };
   }
 }
-
-app.post('/api/log-client-error', (req, res) => {
-  console.error('[BROWSER CLIENT ERROR]:', JSON.stringify(req.body, null, 2));
-  res.json({ ok: true });
-});
-
-// Shared Gemini client
-const getAiClient = () => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) console.warn('[AI Server] GEMINI_API_KEY is missing');
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY environment variable is not set');
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-};
 
 // Rule-based fallback parser for high-demand spikes or offline situations
 function ruleBasedParseTask(speechText: string, currentDate: string, existingLabels?: string[]) {
@@ -153,148 +129,6 @@ function ruleBasedParseTask(speechText: string, currentDate: string, existingLab
     feedback: `Added "${cleaned}" to ${sectionName} for ${dateName}!`,
   };
 }
-
-// API: Parse voice speech or audio into a structured JEE Planner task
-app.post('/api/parse-voice-task', requireUser, async (req, res) => {
-  try {
-    const { speechText, audioBase64, mimeType, currentDate, existingLabels } = req.body;
-
-    if (!speechText && !audioBase64) {
-      return res.status(400).json({ error: 'Either speechText or audioBase64 is required' });
-    }
-
-    const today = currentDate || new Date().toISOString().slice(0, 10);
-    const dayOfWeek = new Date(today + 'T00:00').toLocaleDateString('en-US', { weekday: 'long' });
-
-    const systemInstruction = `You are an expert AI parser for a JEE (Joint Entrance Examination) student study planner.
-The student speaks voice commands to quickly add study tasks, homework, or doubts to their planner.
-Reference context:
-- Current today's date is: ${today} (${dayOfWeek}).
-- Existing available subject labels in planner: ${JSON.stringify(existingLabels || ['Physics', 'Chemistry', 'Maths'])}.
-- Valid planner sections are strictly: 'lectures', 'hw', 'doubts'.
-
-Mapping Rules:
-1. section:
-   - 'lectures': lecture, class, video, session, theory, watch, attend.
-   - 'hw': homework, hw, practice, dpp, sheet, questions, problem set, exercise, solve, assignment.
-   - 'doubts': doubt, query, question for sir, clarify, ask, confusion.
-   - If not clearly specified, choose 'lectures' for topics/classes, 'hw' for problem solving, or 'doubts' for queries.
-2. text:
-   - Clean, well-capitalized, concise task title (e.g. "Geometrical Optics Lecture 1", "HC Verma Ch 10 Q1-25", "Doubt in Rolling Friction").
-   - Strip redundant prefix/suffix command words like "add to lectures", "please add", "put in hw", etc.
-3. date:
-   - If a specific date or relative day is mentioned (e.g. "tomorrow", "day after tomorrow", "yesterday", "next Monday", "Friday", "Oct 12"):
-     Calculate the exact YYYY-MM-DD based on today (${today}, ${dayOfWeek}).
-   - IF NO DATE IS SPECIFIED, ALWAYS return today's date: ${today}.
-4. labelName:
-   - Subject or topic tag (e.g. "Physics", "Chemistry", "Maths", or custom).
-   - Infer from context if obvious (e.g. "Optics", "Mechanics", "Thermodynamics" -> "Physics"; "Organic", "Coordination", "Physical" -> "Chemistry"; "Calculus", "Integration", "Algebra", "Coordinate" -> "Maths").
-   - If unsure or general, return null or the closest match.
-5. type:
-   - 'note' if they specifically state "add note" or "as note".
-   - otherwise 'task'.
-6. feedback:
-   - A friendly, encouraging 1-sentence confirmation suitable for text/speech feedback (e.g. "Added 'Geometrical Optics Lecture 1' to Lectures for today!").`;
-
-    let contents: any;
-    if (audioBase64) {
-      contents = {
-        parts: [
-          {
-            inlineData: {
-              mimeType: mimeType || 'audio/webm',
-              data: audioBase64,
-            },
-          },
-          {
-            text: `Listen to this student voice command, transcribe it, and extract the task details according to instructions.`,
-          },
-        ],
-      };
-    } else {
-      contents = `Student voice input: "${speechText}"`;
-    }
-
-    const ai = getAiClient();
-    const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
-    let lastError: any = null;
-
-    for (const model of modelsToTry) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents,
-          config: {
-            systemInstruction,
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                section: {
-                  type: Type.STRING,
-                  enum: ['lectures', 'hw', 'doubts'],
-                  description: 'The target section in the planner',
-                },
-                text: {
-                  type: Type.STRING,
-                  description: 'The cleaned title of the task without command keywords',
-                },
-                date: {
-                  type: Type.STRING,
-                  description: 'ISO date YYYY-MM-DD for this task',
-                },
-                labelName: {
-                  type: Type.STRING,
-                  description: 'Optional subject or topic label name like Physics, Chemistry, Maths',
-                },
-                type: {
-                  type: Type.STRING,
-                  enum: ['task', 'note'],
-                  description: 'Task checkbox item or informational note',
-                },
-                transcription: {
-                  type: Type.STRING,
-                  description: 'The exact words recognized from speech',
-                },
-                feedback: {
-                  type: Type.STRING,
-                  description: 'Short confirmation feedback sentence',
-                },
-              },
-              required: ['section', 'text', 'date', 'type', 'feedback'],
-            },
-          },
-        });
-
-        const parsedJson = JSON.parse(response.text?.trim() || '{}');
-        if (parsedJson && parsedJson.text) {
-          if (!parsedJson.transcription && speechText) {
-            parsedJson.transcription = speechText;
-          }
-          return res.json({ success: true, data: parsedJson });
-        }
-      } catch (err: any) {
-        lastError = err;
-        console.warn(`[AI Server] Model ${model} failed, trying next... Error:`, err?.message || err);
-      }
-    }
-
-    // Fallback: If text input is provided and AI models are experiencing quota/503 spikes
-    if (speechText) {
-      console.log('[AI Server] Using resilient rule-based parser fallback');
-      const fallbackResult = ruleBasedParseTask(speechText, today, existingLabels);
-      return res.json({ success: true, data: fallbackResult });
-    }
-
-    throw lastError || new Error('Failed to analyze voice task with AI');
-  } catch (error: any) {
-    console.error('Error in /api/parse-voice-task:', error);
-    return res.status(500).json({
-      error: error.message || 'Failed to analyze voice task with AI',
-    });
-  }
-});
 
 // Comprehensive rule-based command parser for offline or instant command execution
 function ruleBasedParseCommand(speechText: string, currentDate: string, existingLabels?: string[]) {
@@ -603,34 +437,282 @@ function ruleBasedParseCommand(speechText: string, currentDate: string, existing
   };
 }
 
-// API: audio transcription + voice command parsing (shared with the Vercel functions in /api)
-app.post('/api/transcribe-audio', requireUser, transcribeAudio);
-app.post('/api/parse-voice-command', requireUser, parseVoiceCommand);
+export async function transcribeAudio(req: any, res: any) {
+  try {
+    const { audioBase64, mimeType } = req.body;
+    if (!audioBase64) {
+      return res.status(400).json({ error: 'No audioBase64 provided' });
+    }
 
-async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
-
-  if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        host: HOST,
-        port: PORT,
+    const ai = getAiClient();
+    const audioPart = {
+      inlineData: {
+        mimeType: mimeType || 'audio/wav',
+        data: audioBase64,
       },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
-  }
+    };
 
-  app.listen(PORT, HOST, () => {
-    console.log(`[AI Studio] JEE Planner server running at http://${HOST}:${PORT}`);
-  });
+    const models = MODELS;
+    let transcribed = '';
+
+    for (const model of models) {
+      try {
+        const transRes = await ai.models.generateContent({
+          model,
+          contents: [
+            audioPart,
+            'Transcribe all spoken words from this audio clip verbatim. If the audio is silence or background noise with no discernable words, return empty string. Return ONLY the transcribed text.',
+          ],
+        });
+        const text = transRes.text?.trim().replace(/^["']|["']$/g, '') || '';
+        if (text && !text.toUpperCase().includes('NO_SPEECH') && !text.toUpperCase().includes('SILENCE')) {
+          transcribed = text;
+          break;
+        }
+      } catch (err: any) {
+        console.warn(`[AI Server] /api/transcribe-audio with ${model} failed:`, err?.message || err);
+      }
+    }
+
+    return res.json({ success: Boolean(transcribed), transcript: transcribed });
+  } catch (err: any) {
+    console.error('Error in /api/transcribe-audio:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to transcribe audio' });
+  }
 }
 
-startServer();
+export async function parseVoiceCommand(req: any, res: any) {
+  try {
+    const { speechText, audioBase64, mimeType, currentDate, existingLabels, currentView } = req.body;
+
+    const today = currentDate || new Date().toISOString().slice(0, 10);
+    const dayOfWeek = new Date(today + 'T00:00').toLocaleDateString('en-US', { weekday: 'long' });
+
+    let recognizedText = speechText ? speechText.trim() : '';
+
+    // If audioBase64 was uploaded without speechText, transcribe it first
+    if (!recognizedText && audioBase64) {
+      console.log('[AI Server] Audio received, transcribing audio...');
+      try {
+        const ai = getAiClient();
+        const audioPart = {
+          inlineData: {
+            mimeType: mimeType || 'audio/wav',
+            data: audioBase64,
+          },
+        };
+
+        const transcribeModels = MODELS;
+        for (const m of transcribeModels) {
+          try {
+            const transRes = await ai.models.generateContent({
+              model: m,
+              contents: [
+                audioPart,
+                'Transcribe all words spoken by the student in this audio clip verbatim. Output only the plain transcribed words.',
+              ],
+            });
+            const textOut = transRes.text?.trim() || '';
+            if (textOut && !textOut.toUpperCase().includes('NO_SPEECH') && !textOut.toUpperCase().includes('SILENCE')) {
+              recognizedText = textOut.replace(/^["']|["']$/g, '').trim();
+              console.log(`[AI Server] Audio transcribed successfully by ${m}: "${recognizedText}"`);
+              break;
+            }
+          } catch (e: any) {
+            console.warn(`[AI Server] Transcription attempt with ${m} failed:`, e?.message || e);
+          }
+        }
+      } catch (err: any) {
+        console.warn('[AI Server] Audio transcription setup failed:', err?.message || err);
+      }
+    }
+
+    // If no text could be recognized at all, gracefully inform the student instead of crashing
+    if (!recognizedText && !speechText) {
+      return res.json({
+        success: true,
+        data: {
+          action: 'feedback_only',
+          feedback: "Could not hear clear speech from your mic. Please speak a little louder or pick a quick command below.",
+          transcription: '',
+          payload: {},
+        },
+      });
+    }
+
+    const systemInstruction = `You are an expert AI voice assistant for a JEE (Joint Entrance Examination) student study planner web application.
+The user speaks voice commands to control ANY function or feature of the entire website.
+Context:
+- Today's date: ${today} (${dayOfWeek}).
+- Available labels: ${JSON.stringify(existingLabels || ['Physics', 'Chemistry', 'Maths'])}.
+- Current view: ${currentView || 'day'}.
+
+Identify user intent and return one of the following structured actions:
+1. 'navigate_view': user wants to view a page (payload: { view: 'day'|'calendar'|'analysis'|'targets'|'label', labelName?: string }).
+2. 'change_date': user wants to change day (payload: { relativeDays?: number, date?: string }).
+3. 'add_task': user wants to add a task/note to lectures, hw, or doubts (payload: { section: 'lectures'|'hw'|'doubts', text: string, date: string, labelName?: string, type: 'task'|'note' }).
+4. 'complete_task': user says marked done / completed (payload: { targetQuery: string }).
+5. 'delete_task': user says delete task / remove task (payload: { targetQuery: string }).
+6. 'add_target': user wants to set a target (payload: { targetName: string, deadline: string, note?: string }).
+7. 'pin_target': user wants to pin target to countdown card (payload: { targetQuery: string }).
+8. 'delete_target': user wants to delete target (payload: { targetQuery: string }).
+9. 'add_event': user wants to add calendar event/test/mock/revision (payload: { title: string, date: string, time?: string, type: 'test'|'revision'|'deadline'|'other' }).
+10. 'delete_event': user wants to delete event (payload: { eventQuery: string }).
+11. 'add_label': user wants to create a new subject/topic label (payload: { labelName: string }).
+12. 'delete_label': user wants to remove/delete a label (payload: { labelName: string }).
+13. 'update_settings': user wants to change wallpaper, layout, accent color, or toggle sidebar (payload: { wallpaper?: string, layout?: string, collapsed?: boolean, accent?: string }).
+14. 'open_settings' or 'close_settings': open or close settings modal.
+15. 'sign_out': user wants to log out.
+
+Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to Calendar view", "Added 'Optics' to Lectures", "Created label 'Revision'").`;
+
+    let contents: any;
+    if (recognizedText) {
+      contents = `Student voice command: "${recognizedText}"`;
+    } else if (audioBase64) {
+      contents = {
+        parts: [
+          {
+            inlineData: {
+              mimeType: mimeType || 'audio/webm',
+              data: audioBase64,
+            },
+          },
+          {
+            text: 'Listen to this voice command, recognize intent, and map to an action for the JEE planner application.',
+          },
+        ],
+      };
+    } else {
+      return res.status(400).json({ error: 'No command text or audio received' });
+    }
+
+    const ai = getAiClient();
+    const modelsToTry = MODELS;
+    let lastError: any = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: {
+            systemInstruction,
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                action: {
+                  type: Type.STRING,
+                  enum: [
+                    'add_task',
+                    'complete_task',
+                    'delete_task',
+                    'navigate_view',
+                    'change_date',
+                    'add_target',
+                    'pin_target',
+                    'delete_target',
+                    'add_event',
+                    'delete_event',
+                    'add_label',
+                    'delete_label',
+                    'update_settings',
+                    'open_settings',
+                    'close_settings',
+                    'sign_out',
+                  ],
+                },
+                feedback: { type: Type.STRING },
+                transcription: { type: Type.STRING },
+                payload: {
+                  type: Type.OBJECT,
+                  properties: {
+                    section: { type: Type.STRING, enum: ['lectures', 'hw', 'doubts'] },
+                    text: { type: Type.STRING },
+                    date: { type: Type.STRING },
+                    labelName: { type: Type.STRING },
+                    type: { type: Type.STRING, enum: ['task', 'note'] },
+                    targetQuery: { type: Type.STRING },
+                    view: { type: Type.STRING },
+                    relativeDays: { type: Type.INTEGER },
+                    targetName: { type: Type.STRING },
+                    deadline: { type: Type.STRING },
+                    note: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    time: { type: Type.STRING },
+                    eventType: { type: Type.STRING, enum: ['test', 'revision', 'deadline', 'other'] },
+                    eventQuery: { type: Type.STRING },
+                    wallpaper: { type: Type.STRING },
+                    layout: { type: Type.STRING },
+                    collapsed: { type: Type.BOOLEAN },
+                    accent: { type: Type.STRING },
+                  },
+                },
+              },
+              required: ['action', 'feedback', 'payload'],
+            },
+          },
+        });
+
+        const parsedJson = JSON.parse(response.text?.trim() || '{}');
+        if (parsedJson && parsedJson.action) {
+          if (!parsedJson.transcription) {
+            parsedJson.transcription = recognizedText || speechText;
+          }
+          if (parsedJson.payload) {
+            // Fix any key misplacement where date was mapped to wallpaper
+            if (!parsedJson.payload.date && parsedJson.payload.wallpaper && /^\d{4}-\d{2}-\d{2}$/.test(parsedJson.payload.wallpaper)) {
+              parsedJson.payload.date = parsedJson.payload.wallpaper;
+              delete parsedJson.payload.wallpaper;
+            }
+            if (parsedJson.action === 'add_task' && !parsedJson.payload.date) {
+              if ((recognizedText || speechText)?.toLowerCase().includes('tomorrow')) {
+                const d = new Date(today + 'T00:00');
+                d.setDate(d.getDate() + 1);
+                parsedJson.payload.date = d.toISOString().slice(0, 10);
+              } else {
+                parsedJson.payload.date = today;
+              }
+            }
+          }
+          return res.json({ success: true, data: parsedJson });
+        }
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[AI Server] Model ${model} command parsing failed, trying next... Error:`, err?.message || err);
+      }
+    }
+
+    // Fallback: If text or recognized audio text provided, use rule-based command engine
+    const textForFallback = recognizedText || speechText;
+    if (textForFallback) {
+      console.log('[AI Server] Falling back to rule-based command parser with:', textForFallback);
+      const fallbackResult = ruleBasedParseCommand(textForFallback, today, existingLabels);
+      fallbackResult.transcription = textForFallback;
+      return res.json({ success: true, data: fallbackResult });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        action: 'feedback_only',
+        feedback: "Could not understand command clearly. Please try speaking again or select a quick command below.",
+        transcription: textForFallback || '',
+        payload: {},
+      },
+    });
+  } catch (error: any) {
+    console.error('Error in /api/parse-voice-command:', error);
+    return res.json({
+      success: true,
+      data: {
+        action: 'feedback_only',
+        feedback: "Could not process audio. Please speak again or select a quick command below.",
+        transcription: '',
+        payload: {},
+      },
+    });
+  }
+}
