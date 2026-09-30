@@ -198,3 +198,22 @@ details{margin-top:10px;color:var(--muted)}
 .ai-spin{animation:spin 1.2s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+/* Live Microphone Voice Reception Visualizer & Status */
+.ai-mic-reception-card{background:#0e0e12cc;border:1px solid #27272a;border-radius:12px;padding:8px 10px;display:grid;gap:6px}
+.ai-mic-status-row{display:flex;align-items:center;justify-content:space-between;font-size:11px}
+.ai-mic-badge{display:inline-flex;align-items:center;gap:6px;font-weight:600;padding:2px 7px;border-radius:999px;font-size:11px}
+.ai-mic-badge.active{background:#22c55e22;color:#4ade80;border:1px solid #22c55e44}
+.ai-mic-badge.waiting{background:#eab30822;color:#facc15;border:1px solid #eab30844}
+.ai-mic-badge.silent{background:#ef444422;color:#f87171;border:1px solid #ef444444}
+.ai-mic-vol-label{color:var(--muted);font-size:11px;font-family:monospace}
+
+.ai-waveform-container{display:flex;align-items:flex-end;gap:3px;height:24px;padding:2px 0}
+.ai-wave-bar{flex:1;background:var(--accent);border-radius:2px;min-height:3px;transition:height .08s ease-out,background .15s}
+.ai-wave-bar.silent{background:#3f3f46;min-height:2px}
+.ai-wave-bar.speaking{background:linear-gradient(to top,#22c55e,#4ade80)}
+
+.ai-vu-bar-bg{height:5px;border-radius:999px;background:#27272a;overflow:hidden;position:relative}
+.ai-vu-bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#22c55e 0%,#eab308 65%,#ef4444 95%);transition:width .08s ease-out}
+
+.ai-mic-silent-warning{font-size:11px;color:#fca5a5;background:#ef444415;padding:5px 8px;border-radius:8px;border:1px solid #ef444433;line-height:1.3}
+

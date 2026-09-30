@@ -16,6 +16,181 @@ function speakFeedback(text) {
   }
 }
 
+// Client-side rule-based command engine (guaranteed zero-downtime fallback)
+function clientParseVoiceCommand(speechText, currentDate, labels = []) {
+  const textLower = speechText.toLowerCase().trim();
+  const today = currentDate || new Date().toISOString().slice(0, 10);
+  const labelNames = labels.map((l) => (typeof l === 'string' ? l : l.name));
+
+  // 1. Navigation
+  if (textLower.includes('calendar') || textLower.includes('month view')) {
+    return { action: 'navigate_view', feedback: 'Switched to Calendar view', payload: { view: 'cal' } };
+  }
+  if (textLower.includes('analysis') || textLower.includes('analytics') || textLower.includes('progress') || textLower.includes('stats')) {
+    return { action: 'navigate_view', feedback: 'Switched to Analysis view', payload: { view: 'analysis' } };
+  }
+  if (textLower.includes('target') || textLower.includes('countdown') || textLower.includes('goals')) {
+    if (!textLower.startsWith('add ') && !textLower.startsWith('new ') && !textLower.startsWith('pin ') && !textLower.startsWith('delete ') && !textLower.startsWith('remove ')) {
+      return { action: 'navigate_view', feedback: 'Switched to Targets view', payload: { view: 'targets' } };
+    }
+  }
+  if (textLower.includes('day view') || textLower.includes('daily view') || textLower.includes('today view') || textLower.includes('show today') || textLower.includes('go to today') || textLower === 'today') {
+    return { action: 'navigate_view', feedback: 'Switched to Day view', payload: { view: 'day' } };
+  }
+
+  // Label navigation
+  for (const lName of labelNames) {
+    if (textLower === lName.toLowerCase() || textLower === `show ${lName.toLowerCase()}` || textLower === `go to ${lName.toLowerCase()}` || textLower === `${lName.toLowerCase()} label`) {
+      return { action: 'navigate_view', feedback: `Showing label ${lName}`, payload: { view: 'label', labelName: lName } };
+    }
+  }
+
+  // 2. Date Navigation
+  if (textLower.includes('tomorrow') && !textLower.startsWith('add') && !textLower.startsWith('new')) {
+    return { action: 'change_date', feedback: 'Navigated to Tomorrow', payload: { relativeDays: 1 } };
+  }
+  if (textLower.includes('yesterday') && !textLower.startsWith('add')) {
+    return { action: 'change_date', feedback: 'Navigated to Yesterday', payload: { relativeDays: -1 } };
+  }
+  if (textLower.includes('next day')) {
+    return { action: 'change_date', feedback: 'Navigated to Next Day', payload: { relativeDays: 1 } };
+  }
+  if (textLower.includes('previous day')) {
+    return { action: 'change_date', feedback: 'Navigated to Previous Day', payload: { relativeDays: -1 } };
+  }
+
+  // 3. Settings / Appearance
+  if (textLower.includes('wallpaper') || textLower.includes('theme') || textLower.includes('background')) {
+    for (const w of ['aurora', 'dusk', 'grid', 'dots', 'plain', 'default']) {
+      if (textLower.includes(w)) {
+        return { action: 'update_settings', feedback: `Wallpaper updated to ${w}`, payload: { wallpaper: w } };
+      }
+    }
+  }
+  if (textLower.includes('stack layout') || textLower.includes('layout stack') || textLower.includes('switch to stack')) {
+    return { action: 'update_settings', feedback: 'Layout set to Stack', payload: { layout: 'stack' } };
+  }
+  if (textLower.includes('column layout') || textLower.includes('layout columns') || textLower.includes('switch to columns') || textLower.includes('grid layout')) {
+    return { action: 'update_settings', feedback: 'Layout set to Columns', payload: { layout: 'columns' } };
+  }
+  if (textLower.includes('sidebar') || textLower.includes('toggle sidebar')) {
+    return { action: 'update_settings', feedback: 'Sidebar toggled', payload: { toggleSidebar: true } };
+  }
+  if (textLower.includes('open settings') || textLower.includes('show settings')) {
+    return { action: 'open_settings', feedback: 'Opened Settings', payload: {} };
+  }
+  if (textLower.includes('close settings')) {
+    return { action: 'close_settings', feedback: 'Closed Settings', payload: {} };
+  }
+
+  // 4. Label Removal
+  if (textLower.startsWith('delete label ') || textLower.startsWith('remove label ')) {
+    const lName = speechText.replace(/^(delete|remove)\s+label\s+/i, '').trim();
+    if (lName) {
+      return { action: 'delete_label', feedback: `Removed label "${lName}"`, payload: { labelName: lName } };
+    }
+  }
+
+  // 5. Target Management
+  if (textLower.startsWith('add target ') || textLower.startsWith('new target ')) {
+    const targetBody = speechText.replace(/^(add|new)\s+target\s+/i, '').trim();
+    let name = targetBody;
+    let deadline = today;
+    const deadlineMatch = targetBody.match(/(?:by|deadline|on)\s+([A-Za-z0-9\s,-]+)$/i);
+    if (deadlineMatch) {
+      name = targetBody.slice(0, deadlineMatch.index).trim();
+      const rawDate = deadlineMatch[1].trim();
+      if (rawDate.toLowerCase().includes('tomorrow')) {
+        const d = new Date(today + 'T00:00');
+        d.setDate(d.getDate() + 1);
+        deadline = d.toISOString().slice(0, 10);
+      } else if (rawDate.toLowerCase().includes('next week')) {
+        const d = new Date(today + 'T00:00');
+        d.setDate(d.getDate() + 7);
+        deadline = d.toISOString().slice(0, 10);
+      } else {
+        const parsed = new Date(rawDate);
+        if (!isNaN(parsed.getTime())) {
+          deadline = parsed.toISOString().slice(0, 10);
+        }
+      }
+    }
+    return { action: 'add_target', feedback: `Added target "${name}" with deadline ${deadline}`, payload: { targetName: name, deadline, note: '' } };
+  }
+  if (textLower.startsWith('pin target ')) {
+    const query = speechText.replace(/^pin\s+target\s+/i, '').trim();
+    return { action: 'pin_target', feedback: `Pinned target "${query}"`, payload: { targetQuery: query } };
+  }
+  if (textLower.startsWith('delete target ') || textLower.startsWith('remove target ')) {
+    const query = speechText.replace(/^(delete|remove)\s+target\s+/i, '').trim();
+    return { action: 'delete_target', feedback: `Deleted target "${query}"`, payload: { targetQuery: query } };
+  }
+
+  // 6. Event Management
+  if (textLower.startsWith('add event ') || textLower.startsWith('add test ') || textLower.startsWith('add revision ')) {
+    let type = 'other';
+    if (textLower.includes('test') || textLower.includes('exam')) type = 'test';
+    else if (textLower.includes('revision') || textLower.includes('revise')) type = 'revision';
+    else if (textLower.includes('deadline')) type = 'deadline';
+    let title = speechText.replace(/^add\s+(event|test|revision)\s+/i, '').trim();
+    let time = '';
+    const timeMatch = title.match(/(?:at|@)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
+    if (timeMatch) {
+      time = timeMatch[1].trim();
+      title = title.replace(timeMatch[0], '').trim();
+    }
+    return { action: 'add_event', feedback: `Added ${type} "${title}"`, payload: { title, date: today, time, eventType: type } };
+  }
+  if (textLower.startsWith('delete event ') || textLower.startsWith('remove event ')) {
+    const query = speechText.replace(/^(delete|remove)\s+event\s+/i, '').trim();
+    return { action: 'delete_event', feedback: `Deleted event "${query}"`, payload: { eventQuery: query } };
+  }
+
+  // 7. Task Complete & Delete
+  if (textLower.startsWith('mark ') && (textLower.endsWith(' done') || textLower.endsWith(' completed') || textLower.includes(' as done'))) {
+    const query = speechText.replace(/^mark\s+/i, '').replace(/\s+(as\s+)?(done|completed)$/i, '').trim();
+    return { action: 'complete_task', feedback: `Marked "${query}" as done!`, payload: { targetQuery: query } };
+  }
+  if (textLower.startsWith('delete task ') || textLower.startsWith('remove task ')) {
+    const query = speechText.replace(/^(delete|remove)\s+task\s+/i, '').trim();
+    return { action: 'delete_task', feedback: `Deleted task "${query}"`, payload: { targetQuery: query } };
+  }
+
+  // 8. Default: Add Task
+  let section = 'lectures';
+  if (textLower.includes('hw') || textLower.includes('homework') || textLower.includes('dpp') || textLower.includes('sheet') || textLower.includes('questions') || textLower.includes('exercise')) {
+    section = 'hw';
+  } else if (textLower.includes('doubt') || textLower.includes('concept') || textLower.includes('problem')) {
+    section = 'doubts';
+  }
+  let date = today;
+  if (textLower.includes('tomorrow')) {
+    const d = new Date(today + 'T00:00');
+    d.setDate(d.getDate() + 1);
+    date = d.toISOString().slice(0, 10);
+  }
+  let labelName = null;
+  for (const l of labelNames) {
+    if (textLower.includes(l.toLowerCase())) {
+      labelName = l;
+      break;
+    }
+  }
+  let cleanedText = speechText
+    .replace(/^add\s+(task\s+)?/i, '')
+    .replace(/^(to\s+)?(lectures|lecture|hw|homework|dpp|doubts|doubt)\s*[:,-]?\s*/i, '')
+    .replace(/\s+(to|in)\s+(lectures|lecture|hw|homework|dpp|doubts|doubt)$/i, '')
+    .trim();
+  if (!cleanedText) cleanedText = speechText;
+
+  const sectionName = section === 'hw' ? 'HW' : section === 'doubts' ? 'Doubts' : 'Lectures';
+  return {
+    action: 'add_task',
+    feedback: `Added "${cleanedText}" to ${sectionName}${labelName ? ' [' + labelName + ']' : ''}`,
+    payload: { section, text: cleanedText, date, labelName, type: 'task' },
+  };
+}
+
 export default function AiVoiceMic({
   currentDate,
   currentView,
@@ -45,6 +220,20 @@ export default function AiVoiceMic({
   const [useDirectAudio, setUseDirectAudio] = useState(false);
   const [manualCmd, setManualCmd] = useState('');
 
+  // Real-time microphone audio & voice reception detection
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [frequencies, setFrequencies] = useState([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+  const [voiceDetected, setVoiceDetected] = useState(false);
+  const [hasReceivedSound, setHasReceivedSound] = useState(false);
+  const [silenceDuration, setSilenceDuration] = useState(0);
+  const [isTestingMic, setIsTestingMic] = useState(false);
+
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animFrameRef = useRef(null);
+  const activeStreamRef = useRef(null);
+  const silenceCounterRef = useRef(0);
+
   // Auto-dismiss errors after 6 seconds
   useEffect(() => {
     if (error) {
@@ -58,11 +247,100 @@ export default function AiVoiceMic({
   const audioChunksRef = useRef([]);
   const feedbackTimerRef = useRef(null);
 
-  // Direct Audio Recorder using browser microphone (bypasses browser cloud speech network)
+  // Real-time audio analyzer using Web Audio API
+  const startAudioVisualizer = (stream) => {
+    try {
+      stopAudioVisualizer();
+      activeStreamRef.current = stream;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+
+      const audioCtx = new AudioCtx();
+      audioContextRef.current = audioCtx;
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      analyserRef.current = analyser;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      silenceCounterRef.current = 0;
+      setSilenceDuration(0);
+      setHasReceivedSound(false);
+
+      const updateMeter = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+
+        let sum = 0;
+        const bars = [];
+        const step = Math.max(1, Math.floor(bufferLength / 12));
+        for (let i = 0; i < 12; i++) {
+          const val = dataArray[i * step] || 0;
+          bars.push(Math.round((val / 255) * 22) + 2);
+          sum += val;
+        }
+        setFrequencies(bars);
+
+        const avg = sum / bufferLength;
+        const level = Math.min(100, Math.round((avg / 128) * 100));
+        setAudioLevel(level);
+
+        if (level > 4) {
+          setVoiceDetected(true);
+          setHasReceivedSound(true);
+          silenceCounterRef.current = 0;
+          setSilenceDuration(0);
+        } else {
+          setVoiceDetected(false);
+          silenceCounterRef.current += 1;
+          if (silenceCounterRef.current % 30 === 0) {
+            setSilenceDuration((prev) => prev + 0.5);
+          }
+        }
+
+        animFrameRef.current = requestAnimationFrame(updateMeter);
+      };
+
+      animFrameRef.current = requestAnimationFrame(updateMeter);
+    } catch (e) {
+      console.warn('Audio visualizer error:', e);
+    }
+  };
+
+  const stopAudioVisualizer = () => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch {}
+      audioContextRef.current = null;
+    }
+    if (activeStreamRef.current) {
+      activeStreamRef.current.getTracks().forEach((track) => track.stop());
+      activeStreamRef.current = null;
+    }
+    setAudioLevel(0);
+    setVoiceDetected(false);
+    setFrequencies([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+  };
+
+  // Direct Audio Recorder using browser microphone
   const startMediaRecorder = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioChunksRef.current = [];
+      startAudioVisualizer(stream);
 
       // Pick best supported MIME type
       let mimeType = 'audio/webm';
@@ -85,7 +363,7 @@ export default function AiVoiceMic({
 
       mediaRecorder.onstop = () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-        stream.getTracks().forEach((track) => track.stop());
+        stopAudioVisualizer();
         setListening(false);
         if (audioChunksRef.current.length > 0) {
           executeVoiceCommand('', audioBlob);
@@ -98,8 +376,33 @@ export default function AiVoiceMic({
       setUseDirectAudio(true);
     } catch (err) {
       console.error('Audio recorder error:', err);
+      stopAudioVisualizer();
       setError('Microphone permission required. Please allow microphone access or type command below.');
       setListening(false);
+    }
+  };
+
+  // Dedicated Microphone Input Check / Test
+  const toggleTestMic = async () => {
+    if (isTestingMic) {
+      stopAudioVisualizer();
+      setIsTestingMic(false);
+      return;
+    }
+
+    try {
+      setError('');
+      if (listening) {
+        if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
+        setListening(false);
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      startAudioVisualizer(stream);
+      setIsTestingMic(true);
+    } catch (err) {
+      console.error('Test mic error:', err);
+      setError('Could not access mic: ' + (err.message || 'Permission denied'));
     }
   };
 
@@ -116,6 +419,9 @@ export default function AiVoiceMic({
         setListening(true);
         setError('');
         setFeedback(null);
+        navigator.mediaDevices?.getUserMedia({ audio: true })
+          .then((stream) => startAudioVisualizer(stream))
+          .catch(() => {});
       };
 
       recognition.onresult = (event) => {
@@ -131,9 +437,8 @@ export default function AiVoiceMic({
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please allow mic permissions in browser.');
           setListening(false);
+          stopAudioVisualizer();
         } else if (event.error === 'network') {
-          // Browser cloud speech recognition failed (e.g. firewall/network block).
-          // Seamlessly auto-switch to direct local audio recording with Gemini AI!
           console.log('SpeechRecognition network issue detected. Seamlessly auto-switching to direct audio recording...');
           setUseDirectAudio(true);
           try {
@@ -143,15 +448,17 @@ export default function AiVoiceMic({
         } else if (event.error !== 'no-speech') {
           setError(`Mic notice: ${event.error}`);
           setListening(false);
+          stopAudioVisualizer();
         } else {
           setListening(false);
+          stopAudioVisualizer();
         }
       };
 
       recognition.onend = () => {
-        // If not in mediaRecorder mode, reset listening
         if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') {
           setListening(false);
+          stopAudioVisualizer();
         }
       };
 
@@ -162,10 +469,9 @@ export default function AiVoiceMic({
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
+      stopAudioVisualizer();
       if (feedbackTimerRef.current) {
         clearTimeout(feedbackTimerRef.current);
       }
@@ -197,18 +503,39 @@ export default function AiVoiceMic({
         payload.speechText = textToProcess;
       }
 
-      const res = await fetch('/api/parse-voice-command', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
+      let commandData = null;
 
-      const resData = await res.json();
-      if (!res.ok || !resData.success) {
-        throw new Error(resData.error || 'Failed to interpret voice command');
+      // 1. Try server-side Gemini AI parser first
+      try {
+        const res = await fetch('/api/parse-voice-command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const resData = await res.json();
+          if (resData && resData.success && resData.data) {
+            commandData = resData.data;
+          }
+        } else {
+          console.warn('Backend responded with non-JSON content:', res.status, contentType);
+        }
+      } catch (fetchErr) {
+        console.warn('Network call to /api/parse-voice-command failed, using client fallback:', fetchErr);
       }
 
-      const { action, feedback: actionFeedback, payload: p } = resData.data;
+      // 2. If server didn't return data and we have text, run instant client-side parser
+      if (!commandData && textToProcess) {
+        commandData = clientParseVoiceCommand(textToProcess, currentDate, labels);
+      }
+
+      if (!commandData) {
+        throw new Error('Could not recognize voice command. Please speak again or type your command below.');
+      }
+
+      const { action, feedback: actionFeedback, payload: p } = commandData;
 
       // Execute matched action across app features
       switch (action) {
@@ -421,13 +748,84 @@ export default function AiVoiceMic({
       {/* Floating Action / Result Banner popping up right above bottom-right button */}
       {listening && (
         <div className="ai-voice-live-hud">
+          {/* Live Mic Reception Checker & Voice Indicator */}
+          <div className="ai-mic-reception-card">
+            <div className="ai-mic-status-row">
+              <span
+                className={`ai-mic-badge ${
+                  voiceDetected
+                    ? 'active'
+                    : hasReceivedSound
+                    ? 'active'
+                    : silenceDuration > 2.5
+                    ? 'silent'
+                    : 'waiting'
+                }`}
+              >
+                <i
+                  className={`ti ${
+                    voiceDetected
+                      ? 'ti-microphone'
+                      : silenceDuration > 2.5
+                      ? 'ti-microphone-off'
+                      : 'ti-waveform'
+                  }`}
+                />
+                {voiceDetected
+                  ? 'Voice Detected & Receiving'
+                  : hasReceivedSound
+                  ? 'Voice Audio Received'
+                  : silenceDuration > 2.5
+                  ? 'No Sound (Mic Muted/Silent)'
+                  : 'Listening (speak now)…'}
+              </span>
+              <span className="ai-mic-vol-label">{audioLevel}% level</span>
+            </div>
+
+            {/* Dynamic visualizer bars jumping to real frequencies */}
+            <div
+              className="ai-waveform-container"
+              title={`Live microphone input: ${audioLevel}%`}
+            >
+              {frequencies.map((h, idx) => (
+                <div
+                  key={idx}
+                  className={`ai-wave-bar ${
+                    voiceDetected ? 'speaking' : h > 4 ? '' : 'silent'
+                  }`}
+                  style={{ height: `${h}px` }}
+                />
+              ))}
+            </div>
+
+            {/* Live Volume VU bar */}
+            <div
+              className="ai-vu-bar-bg"
+              title={`Live input volume: ${audioLevel}%`}
+            >
+              <div
+                className="ai-vu-bar-fill"
+                style={{
+                  width: `${Math.max(audioLevel > 0 ? 6 : 0, audioLevel)}%`,
+                }}
+              />
+            </div>
+
+            {/* Helpful warning if mic volume stays 0% */}
+            {silenceDuration > 3 && !hasReceivedSound && (
+              <div className="ai-mic-silent-warning">
+                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or selected in browser settings.
+              </div>
+            )}
+          </div>
+
           <div className="ai-listening-indicator">
             <span className="ai-dot-pulse" />
             <b>{useDirectAudio ? 'Recording audio for Gemini AI…' : 'Listening for command…'}</b>
           </div>
           <div className="ai-transcript-preview">
             {useDirectAudio
-              ? '🎙️ Speaking... Click the mic button again when you finish speaking!'
+              ? (voiceDetected ? '🟢 Receiving voice sound... Click Done when finished speaking!' : '🎙️ Speak now into microphone. Click Done when finished!')
               : (transcript || 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…')}
           </div>
           <div className="ai-live-actions">
@@ -442,6 +840,7 @@ export default function AiVoiceMic({
                 if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
                   mediaRecorderRef.current.stop();
                 }
+                stopAudioVisualizer();
                 setListening(false);
                 if (transcript.trim()) executeVoiceCommand(transcript.trim());
               }}
@@ -459,11 +858,21 @@ export default function AiVoiceMic({
                 if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
                   mediaRecorderRef.current.stop();
                 }
+                stopAudioVisualizer();
                 setListening(false);
                 setTranscript('');
               }}
             >
               Cancel
+            </button>
+            <button
+              type="button"
+              className="muted"
+              style={{ fontSize: 11, padding: '4px 8px', marginLeft: 'auto' }}
+              onClick={toggleTestMic}
+              title="Test microphone input level"
+            >
+              <i className="ti ti-tool" style={{ marginRight: 3 }} /> Test Mic
             </button>
           </div>
 
@@ -477,6 +886,7 @@ export default function AiVoiceMic({
                 if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
                   mediaRecorderRef.current.stop();
                 }
+                stopAudioVisualizer();
                 setListening(false);
                 executeVoiceCommand(manualCmd.trim());
                 setManualCmd('');
@@ -493,6 +903,94 @@ export default function AiVoiceMic({
               Send
             </button>
           </form>
+        </div>
+      )}
+
+      {/* Dedicated Mic Tester HUD */}
+      {isTestingMic && !listening && (
+        <div className="ai-voice-live-hud">
+          <div className="ai-listening-indicator">
+            <span
+              className="ai-dot-pulse"
+              style={{ background: voiceDetected ? '#22c55e' : '#eab308' }}
+            />
+            <b>Microphone Input Test</b>
+          </div>
+
+          <div className="ai-mic-reception-card">
+            <div className="ai-mic-status-row">
+              <span
+                className={`ai-mic-badge ${
+                  voiceDetected
+                    ? 'active'
+                    : hasReceivedSound
+                    ? 'active'
+                    : silenceDuration > 2.5
+                    ? 'silent'
+                    : 'waiting'
+                }`}
+              >
+                <i
+                  className={`ti ${
+                    voiceDetected
+                      ? 'ti-microphone'
+                      : silenceDuration > 2.5
+                      ? 'ti-microphone-off'
+                      : 'ti-waveform'
+                  }`}
+                />
+                {voiceDetected
+                  ? 'Voice Detected & Receiving'
+                  : hasReceivedSound
+                  ? 'Voice Audio Received'
+                  : silenceDuration > 2.5
+                  ? 'No Sound (Mic Muted/Silent)'
+                  : 'Speak to test mic…'}
+              </span>
+              <span className="ai-mic-vol-label">{audioLevel}% level</span>
+            </div>
+
+            <div className="ai-waveform-container" title={`Live level: ${audioLevel}%`}>
+              {frequencies.map((h, idx) => (
+                <div
+                  key={idx}
+                  className={`ai-wave-bar ${
+                    voiceDetected ? 'speaking' : h > 4 ? '' : 'silent'
+                  }`}
+                  style={{ height: `${h}px` }}
+                />
+              ))}
+            </div>
+
+            <div className="ai-vu-bar-bg" title={`Live input volume: ${audioLevel}%`}>
+              <div
+                className="ai-vu-bar-fill"
+                style={{
+                  width: `${Math.max(audioLevel > 0 ? 6 : 0, audioLevel)}%`,
+                }}
+              />
+            </div>
+
+            {silenceDuration > 3 && !hasReceivedSound && (
+              <div className="ai-mic-silent-warning">
+                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or selected in browser settings.
+              </div>
+            )}
+          </div>
+
+          <div className="ai-live-actions" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontSize: 12, color: voiceDetected ? '#4ade80' : 'var(--muted)' }}>
+              {voiceDetected ? '🟢 Receiving voice input!' : 'Speak into mic to test reception'}
+            </span>
+            <button
+              type="button"
+              className="pill"
+              style={{ padding: '5px 12px', fontSize: 12 }}
+              onClick={toggleTestMic}
+            >
+              Close Test
+            </button>
+          </div>
         </div>
       )}
 
