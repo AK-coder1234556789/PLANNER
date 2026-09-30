@@ -42,15 +42,71 @@ export default function AiVoiceMic({
   const [feedback, setFeedback] = useState(null);
   const [error, setError] = useState('');
 
+  const [useDirectAudio, setUseDirectAudio] = useState(false);
+  const [manualCmd, setManualCmd] = useState('');
+
+  // Auto-dismiss errors after 6 seconds
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(''), 6000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
   const recognitionRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const feedbackTimerRef = useRef(null);
 
+  // Direct Audio Recorder using browser microphone (bypasses browser cloud speech network)
+  const startMediaRecorder = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+
+      // Pick best supported MIME type
+      let mimeType = 'audio/webm';
+      if (typeof MediaRecorder.isTypeSupported === 'function') {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        }
+      }
+
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+        stream.getTracks().forEach((track) => track.stop());
+        setListening(false);
+        if (audioChunksRef.current.length > 0) {
+          executeVoiceCommand('', audioBlob);
+        }
+      };
+
+      mediaRecorder.start();
+      setListening(true);
+      setError('');
+      setUseDirectAudio(true);
+    } catch (err) {
+      console.error('Audio recorder error:', err);
+      setError('Microphone permission required. Please allow microphone access or type command below.');
+      setListening(false);
+    }
+  };
+
   // Setup Web Speech Recognition
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognition) {
+    if (SpeechRecognition && !useDirectAudio) {
       const recognition = new SpeechRecognition();
       recognition.continuous = false;
       recognition.interimResults = true;
@@ -74,14 +130,29 @@ export default function AiVoiceMic({
         console.warn('SpeechRecognition notice:', event.error);
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please allow mic permissions in browser.');
+          setListening(false);
+        } else if (event.error === 'network') {
+          // Browser cloud speech recognition failed (e.g. firewall/network block).
+          // Seamlessly auto-switch to direct local audio recording with Gemini AI!
+          console.log('SpeechRecognition network issue detected. Seamlessly auto-switching to direct audio recording...');
+          setUseDirectAudio(true);
+          try {
+            recognition.abort();
+          } catch {}
+          startMediaRecorder();
         } else if (event.error !== 'no-speech') {
           setError(`Mic notice: ${event.error}`);
+          setListening(false);
+        } else {
+          setListening(false);
         }
-        setListening(false);
       };
 
       recognition.onend = () => {
-        setListening(false);
+        // If not in mediaRecorder mode, reset listening
+        if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') {
+          setListening(false);
+        }
       };
 
       recognitionRef.current = recognition;
@@ -99,7 +170,7 @@ export default function AiVoiceMic({
         clearTimeout(feedbackTimerRef.current);
       }
     };
-  }, []);
+  }, [useDirectAudio]);
 
   // Process recognized command with Gemini AI
   const executeVoiceCommand = async (textToProcess, audioBlob = null) => {
@@ -326,55 +397,38 @@ export default function AiVoiceMic({
 
     // Start listening
     setTranscript('');
+
+    if (useDirectAudio) {
+      return startMediaRecorder();
+    }
+
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start();
         return;
       } catch (err) {
-        console.warn('SpeechRecognition start failed, trying MediaRecorder:', err);
+        console.warn('SpeechRecognition start failed, switching to MediaRecorder:', err);
+        return startMediaRecorder();
       }
     }
 
     // Fallback: MediaRecorder
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioChunksRef.current = [];
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) audioChunksRef.current.push(event.data);
-      };
-
-      mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        stream.getTracks().forEach((track) => track.stop());
-        setListening(false);
-        if (audioChunksRef.current.length > 0) {
-          executeVoiceCommand('', audioBlob);
-        }
-      };
-
-      mediaRecorder.start();
-      setListening(true);
-    } catch (err) {
-      console.error('Mic access error:', err);
-      setError('Microphone access denied. Please allow microphone access.');
-      setListening(false);
-    }
+    return startMediaRecorder();
   };
 
   return (
     <div className="ai-voice-floating-container">
-      {/* Floating Action / Result Banner popping up right above bottom-left button */}
+      {/* Floating Action / Result Banner popping up right above bottom-right button */}
       {listening && (
         <div className="ai-voice-live-hud">
           <div className="ai-listening-indicator">
             <span className="ai-dot-pulse" />
-            <b>Listening for command…</b>
+            <b>{useDirectAudio ? 'Recording audio for Gemini AI…' : 'Listening for command…'}</b>
           </div>
           <div className="ai-transcript-preview">
-            {transcript || 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…'}
+            {useDirectAudio
+              ? '🎙️ Speaking... Click the mic button again when you finish speaking!'
+              : (transcript || 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…')}
           </div>
           <div className="ai-live-actions">
             <button
@@ -384,6 +438,9 @@ export default function AiVoiceMic({
               onClick={() => {
                 if (recognitionRef.current) {
                   try { recognitionRef.current.stop(); } catch {}
+                }
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                  mediaRecorderRef.current.stop();
                 }
                 setListening(false);
                 if (transcript.trim()) executeVoiceCommand(transcript.trim());
@@ -399,6 +456,9 @@ export default function AiVoiceMic({
                 if (recognitionRef.current) {
                   try { recognitionRef.current.stop(); } catch {}
                 }
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                  mediaRecorderRef.current.stop();
+                }
                 setListening(false);
                 setTranscript('');
               }}
@@ -406,6 +466,33 @@ export default function AiVoiceMic({
               Cancel
             </button>
           </div>
+
+          {/* Quick text input option */}
+          <form
+            style={{ display: 'flex', gap: 6, marginTop: 4 }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (manualCmd.trim()) {
+                if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
+                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                  mediaRecorderRef.current.stop();
+                }
+                setListening(false);
+                executeVoiceCommand(manualCmd.trim());
+                setManualCmd('');
+              }
+            }}
+          >
+            <input
+              value={manualCmd}
+              onChange={(e) => setManualCmd(e.target.value)}
+              placeholder="Or type command here…"
+              style={{ flex: 1, padding: '5px 8px', fontSize: 12 }}
+            />
+            <button type="submit" className="pill" style={{ padding: '5px 10px', fontSize: 11 }}>
+              Send
+            </button>
+          </form>
         </div>
       )}
 
