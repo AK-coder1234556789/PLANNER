@@ -2,12 +2,14 @@ import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 dotenv.config({ override: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const fbConfig = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf8'));
 
 const app = express();
 
@@ -18,14 +20,33 @@ const HOST = '0.0.0.0';
 
 app.use(express.json({ limit: '15mb' }));
 
-app.get('/api/debug-env', (_req, res) => {
-  const k = process.env.GEMINI_API_KEY;
-  res.json({
-    hasGeminiKey: Boolean(k),
-    prefix: k ? k.slice(0, 10) : 'none',
-    length: k ? k.length : 0,
-  });
-});
+// Only signed-in planner users may call the AI routes (protects the Gemini quota).
+// The browser sends its Firebase ID token; we verify it with Firebase and rate-limit per user.
+const hits = new Map<string, number[]>();
+async function requireUser(req: express.Request, res: express.Response, next: express.NextFunction) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'Sign in required' });
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${fbConfig.apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: token }),
+    });
+    if (!r.ok) return res.status(401).json({ error: 'Invalid or expired sign-in' });
+    const data: any = await r.json();
+    const uid = data?.users?.[0]?.localId;
+    if (!uid) return res.status(401).json({ error: 'Invalid sign-in' });
+    const now = Date.now();
+    const recent = (hits.get(uid) || []).filter((t) => now - t < 60_000);
+    if (recent.length >= 30) return res.status(429).json({ error: 'Too many requests. Wait a minute and try again.' });
+    recent.push(now);
+    hits.set(uid, recent);
+    next();
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not verify sign-in' });
+  }
+}
 
 app.post('/api/log-client-error', (req, res) => {
   console.error('[BROWSER CLIENT ERROR]:', JSON.stringify(req.body, null, 2));
@@ -35,7 +56,7 @@ app.post('/api/log-client-error', (req, res) => {
 // Shared Gemini client
 const getAiClient = () => {
   const apiKey = process.env.GEMINI_API_KEY;
-  console.log('[AI Server] Using GEMINI_API_KEY prefix:', apiKey ? apiKey.slice(0, 8) : 'MISSING');
+  if (!apiKey) console.warn('[AI Server] GEMINI_API_KEY is missing');
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY environment variable is not set');
   }
@@ -133,7 +154,7 @@ function ruleBasedParseTask(speechText: string, currentDate: string, existingLab
 }
 
 // API: Parse voice speech or audio into a structured JEE Planner task
-app.post('/api/parse-voice-task', async (req, res) => {
+app.post('/api/parse-voice-task', requireUser, async (req, res) => {
   try {
     const { speechText, audioBase64, mimeType, currentDate, existingLabels } = req.body;
 
@@ -582,7 +603,7 @@ function ruleBasedParseCommand(speechText: string, currentDate: string, existing
 }
 
 // API: Direct real-time audio transcription endpoint
-app.post('/api/transcribe-audio', async (req, res) => {
+app.post('/api/transcribe-audio', requireUser, async (req, res) => {
   try {
     const { audioBase64, mimeType } = req.body;
     if (!audioBase64) {
@@ -627,7 +648,7 @@ app.post('/api/transcribe-audio', async (req, res) => {
 });
 
 // API: Comprehensive AI Voice Command handler for controlling the entire website
-app.post('/api/parse-voice-command', async (req, res) => {
+app.post('/api/parse-voice-command', requireUser, async (req, res) => {
   try {
     const { speechText, audioBase64, mimeType, currentDate, existingLabels, currentView } = req.body;
 

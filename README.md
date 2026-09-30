@@ -27,3 +27,10 @@ Drag-to-reorder, rename and delete labels.
 - "Google sign-in is not enabled": turn on Google under Authentication > Sign-in method.
 - Popup blocked (common on phones): the app automatically switches to a full-page Google sign-in.
 - Sync: the sidebar shows Synced, Syncing or Offline. Offline changes are kept on the device and upload when you reconnect.
+
+## Voice commands (AI mic)
+The round mic button (bottom right) lets you add tasks, mark things done, switch views and change settings by voice. It uses the browser's speech recognition. If the AI server is reachable, Gemini understands the command; if not, a built-in parser handles common commands.
+
+- Needs `GEMINI_API_KEY` in `.env` (server only, never commit it). Run with `npm run dev` (this starts `server.ts`).
+- The AI routes only accept requests from signed-in users and are limited to 30 requests per minute per user.
+- On Vercel the static site has no `server.ts`, so only the built-in parser works there. Host the server elsewhere or ask for a Vercel functions version to get the Gemini-powered parsing online.
