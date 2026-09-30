@@ -220,6 +220,12 @@ export default function AiVoiceMic({
   const [useDirectAudio, setUseDirectAudio] = useState(false);
   const [manualCmd, setManualCmd] = useState('');
 
+  // Audio Device Selection
+  const [audioDevices, setAudioDevices] = useState([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState(() => {
+    return localStorage.getItem('jee_selected_mic_id') || '';
+  });
+
   // Real-time microphone audio & voice reception detection
   const [audioLevel, setAudioLevel] = useState(0);
   const [frequencies, setFrequencies] = useState([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
@@ -246,6 +252,67 @@ export default function AiVoiceMic({
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const feedbackTimerRef = useRef(null);
+
+  // Load and enumerate all available microphone devices
+  const loadAudioDevices = async () => {
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter((d) => d.kind === 'audioinput');
+      setAudioDevices(inputs);
+    } catch (e) {
+      console.warn('Could not enumerate audio devices:', e);
+    }
+  };
+
+  useEffect(() => {
+    loadAudioDevices();
+    if (navigator.mediaDevices?.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', loadAudioDevices);
+      return () => {
+        navigator.mediaDevices.removeEventListener('devicechange', loadAudioDevices);
+      };
+    }
+  }, []);
+
+  // Helper to obtain audio media stream using selected mic device
+  const getAudioStream = async (deviceIdOverride) => {
+    const targetDevId = deviceIdOverride !== undefined ? deviceIdOverride : selectedDeviceId;
+    const constraints = {
+      audio: targetDevId
+        ? {
+            deviceId: { exact: targetDevId },
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        : {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+    };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    // Reload devices now that permission is active to reveal device labels
+    loadAudioDevices();
+    return stream;
+  };
+
+  // Change microphone input
+  const handleDeviceChange = async (newDeviceId) => {
+    setSelectedDeviceId(newDeviceId);
+    localStorage.setItem('jee_selected_mic_id', newDeviceId);
+
+    // If currently testing or recording, immediately switch audio stream to new mic
+    if (isTestingMic || listening) {
+      try {
+        const stream = await getAudioStream(newDeviceId);
+        startAudioVisualizer(stream);
+      } catch (err) {
+        console.warn('Switch mic error:', err);
+      }
+    }
+  };
 
   // Real-time audio analyzer using Web Audio API
   const startAudioVisualizer = (stream) => {
@@ -338,7 +405,7 @@ export default function AiVoiceMic({
   // Direct Audio Recorder using browser microphone
   const startMediaRecorder = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await getAudioStream();
       audioChunksRef.current = [];
       startAudioVisualizer(stream);
 
@@ -366,7 +433,7 @@ export default function AiVoiceMic({
         stopAudioVisualizer();
         setListening(false);
         if (audioChunksRef.current.length > 0) {
-          executeVoiceCommand('', audioBlob);
+          executeVoiceCommand(manualCmd || transcript || '', audioBlob);
         }
       };
 
@@ -377,7 +444,7 @@ export default function AiVoiceMic({
     } catch (err) {
       console.error('Audio recorder error:', err);
       stopAudioVisualizer();
-      setError('Microphone permission required. Please allow microphone access or type command below.');
+      setError('Microphone permission required. Please allow microphone access or select mic.');
       setListening(false);
     }
   };
@@ -397,21 +464,21 @@ export default function AiVoiceMic({
         if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
         setListening(false);
       }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await getAudioStream();
       startAudioVisualizer(stream);
       setIsTestingMic(true);
     } catch (err) {
       console.error('Test mic error:', err);
-      setError('Could not access mic: ' + (err.message || 'Permission denied'));
+      setError('Could not access selected mic: ' + (err.message || 'Permission denied'));
     }
   };
 
-  // Setup Web Speech Recognition
+  // Setup Web Speech Recognition with continuous active transcription
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition && !useDirectAudio) {
       const recognition = new SpeechRecognition();
-      recognition.continuous = false;
+      recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = 'en-IN'; // Indian English / general English fits JEE terminology
 
@@ -419,17 +486,19 @@ export default function AiVoiceMic({
         setListening(true);
         setError('');
         setFeedback(null);
-        navigator.mediaDevices?.getUserMedia({ audio: true })
+        getAudioStream()
           .then((stream) => startAudioVisualizer(stream))
           .catch(() => {});
       };
 
       recognition.onresult = (event) => {
-        let current = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          current += event.results[i][0].transcript;
+        let full = '';
+        for (let i = 0; i < event.results.length; i++) {
+          full += event.results[i][0].transcript + ' ';
         }
-        setTranscript(current);
+        const text = full.trim();
+        setTranscript(text);
+        setManualCmd(text); // ACTIVELY write into the command input in real-time as spoken!
       };
 
       recognition.onerror = (event) => {
@@ -476,7 +545,7 @@ export default function AiVoiceMic({
         clearTimeout(feedbackTimerRef.current);
       }
     };
-  }, [useDirectAudio]);
+  }, [useDirectAudio, selectedDeviceId]);
 
   // Process recognized command with Gemini AI
   const executeVoiceCommand = async (textToProcess, audioBlob = null) => {
@@ -748,6 +817,26 @@ export default function AiVoiceMic({
       {/* Floating Action / Result Banner popping up right above bottom-right button */}
       {listening && (
         <div className="ai-voice-live-hud">
+          {/* Microphone Device Selection */}
+          <div className="ai-mic-select-container">
+            <span className="ai-mic-select-label">
+              <i className="ti ti-microphone" /> Mic Input:
+            </span>
+            <select
+              className="ai-mic-dropdown"
+              value={selectedDeviceId}
+              onChange={(e) => handleDeviceChange(e.target.value)}
+              title="Select which microphone to record from"
+            >
+              <option value="">Default Microphone</option>
+              {audioDevices.map((d, idx) => (
+                <option key={d.deviceId || idx} value={d.deviceId}>
+                  {d.label || `Microphone ${idx + 1}`}
+                </option>
+              ))}
+            </select>
+          </div>
+
           {/* Live Mic Reception Checker & Voice Indicator */}
           <div className="ai-mic-reception-card">
             <div className="ai-mic-status-row">
@@ -814,25 +903,33 @@ export default function AiVoiceMic({
             {/* Helpful warning if mic volume stays 0% */}
             {silenceDuration > 3 && !hasReceivedSound && (
               <div className="ai-mic-silent-warning">
-                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or selected in browser settings.
+                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or switch mic above.
               </div>
             )}
           </div>
 
-          <div className="ai-listening-indicator">
-            <span className="ai-dot-pulse" />
-            <b>{useDirectAudio ? 'Recording audio for Gemini AI…' : 'Listening for command…'}</b>
+          {/* Real-Time Actively Written Transcription Box */}
+          <div className="ai-active-transcription-card recording">
+            <div className="ai-active-header">
+              <span>
+                <span className="ai-active-live-dot" />
+                Actively Writing What Is Recorded
+              </span>
+              <span style={{ color: voiceDetected ? '#4ade80' : 'var(--muted)', fontWeight: 600 }}>
+                {voiceDetected ? '🟢 Receiving Voice' : '🎙️ Speak Now'}
+              </span>
+            </div>
+            <div className={`ai-active-text ${!transcript && !manualCmd ? 'placeholder' : ''}`}>
+              {transcript || manualCmd || 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…'}
+              <span className="ai-blinking-cursor">|</span>
+            </div>
           </div>
-          <div className="ai-transcript-preview">
-            {useDirectAudio
-              ? (voiceDetected ? '🟢 Receiving voice sound... Click Done when finished speaking!' : '🎙️ Speak now into microphone. Click Done when finished!')
-              : (transcript || 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…')}
-          </div>
+
           <div className="ai-live-actions">
             <button
               type="button"
-              className="pill"
-              style={{ padding: '5px 12px', fontSize: 12 }}
+              className="pill primary"
+              style={{ padding: '5px 14px', fontSize: 12, fontWeight: 600 }}
               onClick={() => {
                 if (recognitionRef.current) {
                   try { recognitionRef.current.stop(); } catch {}
@@ -842,7 +939,8 @@ export default function AiVoiceMic({
                 }
                 stopAudioVisualizer();
                 setListening(false);
-                if (transcript.trim()) executeVoiceCommand(transcript.trim());
+                const cmd = (transcript || manualCmd).trim();
+                if (cmd) executeVoiceCommand(cmd);
               }}
             >
               Done & Run
@@ -861,6 +959,7 @@ export default function AiVoiceMic({
                 stopAudioVisualizer();
                 setListening(false);
                 setTranscript('');
+                setManualCmd('');
               }}
             >
               Cancel
@@ -876,31 +975,36 @@ export default function AiVoiceMic({
             </button>
           </div>
 
-          {/* Quick text input option */}
+          {/* Real-time editable command form */}
           <form
-            style={{ display: 'flex', gap: 6, marginTop: 4 }}
+            style={{ display: 'flex', gap: 6, marginTop: 2 }}
             onSubmit={(e) => {
               e.preventDefault();
-              if (manualCmd.trim()) {
+              const cmd = (manualCmd || transcript).trim();
+              if (cmd) {
                 if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
                 if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
                   mediaRecorderRef.current.stop();
                 }
                 stopAudioVisualizer();
                 setListening(false);
-                executeVoiceCommand(manualCmd.trim());
+                executeVoiceCommand(cmd);
                 setManualCmd('');
+                setTranscript('');
               }
             }}
           >
             <input
-              value={manualCmd}
-              onChange={(e) => setManualCmd(e.target.value)}
-              placeholder="Or type command here…"
-              style={{ flex: 1, padding: '5px 8px', fontSize: 12 }}
+              value={manualCmd || transcript}
+              onChange={(e) => {
+                setManualCmd(e.target.value);
+                setTranscript(e.target.value);
+              }}
+              placeholder="Actively written words appear here (or type to edit)…"
+              style={{ flex: 1, padding: '6px 9px', fontSize: 12, borderRadius: 8, background: '#1c1c20', color: '#fff', border: '1px solid #3f3f46' }}
             />
-            <button type="submit" className="pill" style={{ padding: '5px 10px', fontSize: 11 }}>
-              Send
+            <button type="submit" className="pill" style={{ padding: '6px 12px', fontSize: 11 }}>
+              Execute
             </button>
           </form>
         </div>
@@ -914,7 +1018,27 @@ export default function AiVoiceMic({
               className="ai-dot-pulse"
               style={{ background: voiceDetected ? '#22c55e' : '#eab308' }}
             />
-            <b>Microphone Input Test</b>
+            <b>Microphone Input Test & Device Selector</b>
+          </div>
+
+          {/* Microphone Selector Dropdown in Tester */}
+          <div className="ai-mic-select-container">
+            <span className="ai-mic-select-label">
+              <i className="ti ti-microphone" /> Switch Mic:
+            </span>
+            <select
+              className="ai-mic-dropdown"
+              value={selectedDeviceId}
+              onChange={(e) => handleDeviceChange(e.target.value)}
+              title="Select which microphone to test"
+            >
+              <option value="">Default Microphone</option>
+              {audioDevices.map((d, idx) => (
+                <option key={d.deviceId || idx} value={d.deviceId}>
+                  {d.label || `Microphone ${idx + 1}`}
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="ai-mic-reception-card">
@@ -973,7 +1097,7 @@ export default function AiVoiceMic({
 
             {silenceDuration > 3 && !hasReceivedSound && (
               <div className="ai-mic-silent-warning">
-                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or selected in browser settings.
+                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or switch to another mic above.
               </div>
             )}
           </div>

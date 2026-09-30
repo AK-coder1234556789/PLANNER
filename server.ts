@@ -593,6 +593,45 @@ app.post('/api/parse-voice-command', async (req, res) => {
     const today = currentDate || new Date().toISOString().slice(0, 10);
     const dayOfWeek = new Date(today + 'T00:00').toLocaleDateString('en-US', { weekday: 'long' });
 
+    let recognizedText = speechText ? speechText.trim() : '';
+
+    // If audioBase64 was uploaded without speechText, transcribe it first
+    if (!recognizedText && audioBase64) {
+      console.log('[AI Server] Audio received, transcribing audio...');
+      try {
+        const ai = getAiClient();
+        const audioPart = {
+          inlineData: {
+            mimeType: mimeType || 'audio/webm',
+            data: audioBase64,
+          },
+        };
+
+        const transcribeModels = ['gemini-3.5-transcribe', 'gemini-2.5-flash', 'gemini-3.8-flash'];
+        for (const m of transcribeModels) {
+          try {
+            const transRes = await ai.models.generateContent({
+              model: m,
+              contents: [
+                audioPart,
+                'Generate a verbatim transcript of this student speech command for a study planner. Output only the plain transcribed words.',
+              ],
+            });
+            const textOut = transRes.text?.trim() || '';
+            if (textOut) {
+              recognizedText = textOut.replace(/^["']|["']$/g, '').trim();
+              console.log(`[AI Server] Audio transcribed successfully by ${m}: "${recognizedText}"`);
+              break;
+            }
+          } catch (e: any) {
+            console.warn(`[AI Server] Transcription attempt with ${m} failed:`, e?.message || e);
+          }
+        }
+      } catch (err: any) {
+        console.warn('[AI Server] Audio transcription setup failed:', err?.message || err);
+      }
+    }
+
     const systemInstruction = `You are an expert AI voice assistant for a JEE (Joint Entrance Examination) student study planner web application.
 The user speaks voice commands to control ANY function or feature of the entire website.
 Context:
@@ -620,7 +659,9 @@ Identify user intent and return one of the following structured actions:
 Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to Calendar view", "Added 'Optics' to Lectures", "Created label 'Revision'").`;
 
     let contents: any;
-    if (audioBase64) {
+    if (recognizedText) {
+      contents = `Student voice command: "${recognizedText}"`;
+    } else if (audioBase64) {
       contents = {
         parts: [
           {
@@ -635,7 +676,7 @@ Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to
         ],
       };
     } else {
-      contents = `Student voice command: "${speechText}"`;
+      return res.status(400).json({ error: 'No command text or audio received' });
     }
 
     const ai = getAiClient();
@@ -709,8 +750,8 @@ Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to
 
         const parsedJson = JSON.parse(response.text?.trim() || '{}');
         if (parsedJson && parsedJson.action) {
-          if (!parsedJson.transcription && speechText) {
-            parsedJson.transcription = speechText;
+          if (!parsedJson.transcription) {
+            parsedJson.transcription = recognizedText || speechText;
           }
           if (parsedJson.payload) {
             // Fix any key misplacement where date was mapped to wallpaper
@@ -719,7 +760,7 @@ Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to
               delete parsedJson.payload.wallpaper;
             }
             if (parsedJson.action === 'add_task' && !parsedJson.payload.date) {
-              if (speechText?.toLowerCase().includes('tomorrow')) {
+              if ((recognizedText || speechText)?.toLowerCase().includes('tomorrow')) {
                 const d = new Date(today + 'T00:00');
                 d.setDate(d.getDate() + 1);
                 parsedJson.payload.date = d.toISOString().slice(0, 10);
@@ -736,10 +777,12 @@ Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to
       }
     }
 
-    // Fallback: If text provided, use rule-based command engine
-    if (speechText) {
-      console.log('[AI Server] Falling back to rule-based command parser');
-      const fallbackResult = ruleBasedParseCommand(speechText, today, existingLabels);
+    // Fallback: If text or recognized audio text provided, use rule-based command engine
+    const textForFallback = recognizedText || speechText;
+    if (textForFallback) {
+      console.log('[AI Server] Falling back to rule-based command parser with:', textForFallback);
+      const fallbackResult = ruleBasedParseCommand(textForFallback, today, existingLabels);
+      fallbackResult.transcription = textForFallback;
       return res.json({ success: true, data: fallbackResult });
     }
 
