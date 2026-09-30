@@ -1,7 +1,25 @@
 import { useEffect, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signInWithRedirect, getRedirectResult, signOut } from 'firebase/auth';
-import { collection, doc, addDoc, updateDoc, deleteDoc, setDoc, onSnapshot, arrayUnion, arrayRemove } from 'firebase/firestore';
-import { auth, provider, db, configured } from './firebase';
+import {
+  auth,
+  provider,
+  db,
+  configured,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
+  collection,
+  doc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  setDoc,
+  onSnapshot,
+  arrayUnion,
+  arrayRemove,
+  signInGuest,
+} from './firebase';
 
 const SECTIONS = [['lectures', 'Lectures'], ['hw', 'HW'], ['doubts', 'Doubts']];
 const EV = { test: ['Test', '#ef4444'], revision: ['Revision', '#3b82f6'], deadline: ['Deadline', '#f59e0b'], other: ['Other', '#a78bfa'] };
@@ -29,7 +47,6 @@ export default function App() {
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    if (!configured) return;
     getRedirectResult(auth).catch((e) => setErr(friendly(e)));
     return onAuthStateChanged(auth, setUser);
   }, []);
@@ -42,7 +59,10 @@ export default function App() {
       setBusy(false);
     }
   };
-  if (!configured) return <div className="center"><div className="card login"><h2>Connect Firebase</h2><p className="muted">Copy .env.example to .env, fill in your Firebase web app values, then restart the dev server.</p></div></div>;
+  const loginGuest = () => {
+    signInGuest();
+  };
+
   if (user === undefined) return <div className="center muted">Loading…</div>;
   if (!user) return (
     <div className="center">
@@ -50,7 +70,17 @@ export default function App() {
         <div className="logo"><i className="ti ti-target" /></div>
         <h2>Plan every day.<br />Finish the syllabus.</h2>
         <p className="muted">Your tasks, notes and calendar sync in real time between your phone and laptop.</p>
-        <button className="gbtn" onClick={login} disabled={busy}>{GLogo}{busy ? 'Signing in…' : 'Continue with Google'}</button>
+        {configured ? (
+          <>
+            <button className="gbtn" onClick={login} disabled={busy}>{GLogo}{busy ? 'Signing in…' : 'Continue with Google'}</button>
+            <button className="pill" style={{ width: '100%', background: '#ffffff12', color: 'var(--text)' }} onClick={loginGuest}>Explore in Guest Mode</button>
+          </>
+        ) : (
+          <>
+            <button className="gbtn" onClick={loginGuest}><i className="ti ti-user" /> Continue as Guest</button>
+            <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>Firebase credentials not detected in .env. Running with local offline persistence.</p>
+          </>
+        )}
         {err && <p className="err">{err}</p>}
       </div>
     </div>
