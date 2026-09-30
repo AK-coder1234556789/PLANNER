@@ -402,6 +402,49 @@ export default function AiVoiceMic({
     setFrequencies([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
   };
 
+  const isTranscribingRef = useRef(false);
+  const liveTranscribeTimerRef = useRef(null);
+
+  // Active live headset audio transcriber (sends captured audio snippets to Gemini for live text display)
+  const triggerLiveTranscribe = () => {
+    if (liveTranscribeTimerRef.current) clearTimeout(liveTranscribeTimerRef.current);
+    liveTranscribeTimerRef.current = setTimeout(async () => {
+      if (isTranscribingRef.current || audioChunksRef.current.length === 0) return;
+      isTranscribingRef.current = true;
+      try {
+        const mime = mediaRecorderRef.current?.mimeType || 'audio/webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type: mime });
+        if (audioBlob.size < 500) return; // Too small to contain speech
+
+        const reader = new FileReader();
+        const base64Promise = new Promise((resolve) => {
+          reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
+        });
+        reader.readAsDataURL(audioBlob);
+        const b64 = await base64Promise;
+        if (!b64) return;
+
+        const res = await fetch('/api/transcribe-audio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audioBase64: b64, mimeType: mime }),
+        });
+
+        if (res.ok) {
+          const resData = await res.json();
+          if (resData.success && resData.transcript) {
+            setTranscript(resData.transcript);
+            setManualCmd(resData.transcript);
+          }
+        }
+      } catch (err) {
+        console.warn('Live transcribe check failed:', err);
+      } finally {
+        isTranscribingRef.current = false;
+      }
+    }, 650);
+  };
+
   // Direct Audio Recorder using browser microphone
   const startMediaRecorder = async () => {
     try {
@@ -425,6 +468,8 @@ export default function AiVoiceMic({
       mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
           audioChunksRef.current.push(event.data);
+          // When sound has been received, trigger live transcription
+          triggerLiveTranscribe();
         }
       };
 
@@ -437,7 +482,8 @@ export default function AiVoiceMic({
         }
       };
 
-      mediaRecorder.start();
+      // Collect data in 800ms timeslices so live transcription can stream actively
+      mediaRecorder.start(800);
       setListening(true);
       setError('');
       setUseDirectAudio(true);
@@ -476,19 +522,14 @@ export default function AiVoiceMic({
   // Setup Web Speech Recognition with continuous active transcription
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognition && !useDirectAudio) {
+    if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = 'en-IN'; // Indian English / general English fits JEE terminology
 
       recognition.onstart = () => {
-        setListening(true);
         setError('');
-        setFeedback(null);
-        getAudioStream()
-          .then((stream) => startAudioVisualizer(stream))
-          .catch(() => {});
       };
 
       recognition.onresult = (event) => {
@@ -497,38 +538,21 @@ export default function AiVoiceMic({
           full += event.results[i][0].transcript + ' ';
         }
         const text = full.trim();
-        setTranscript(text);
-        setManualCmd(text); // ACTIVELY write into the command input in real-time as spoken!
+        if (text) {
+          setTranscript(text);
+          setManualCmd(text); // ACTIVELY write into the command input in real-time as spoken!
+        }
       };
 
       recognition.onerror = (event) => {
         console.warn('SpeechRecognition notice:', event.error);
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please allow mic permissions in browser.');
-          setListening(false);
-          stopAudioVisualizer();
-        } else if (event.error === 'network') {
-          console.log('SpeechRecognition network issue detected. Seamlessly auto-switching to direct audio recording...');
-          setUseDirectAudio(true);
-          try {
-            recognition.abort();
-          } catch {}
-          startMediaRecorder();
-        } else if (event.error !== 'no-speech') {
-          setError(`Mic notice: ${event.error}`);
-          setListening(false);
-          stopAudioVisualizer();
-        } else {
-          setListening(false);
-          stopAudioVisualizer();
         }
       };
 
       recognition.onend = () => {
-        if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') {
-          setListening(false);
-          stopAudioVisualizer();
-        }
+        // Kept alive by mediaRecorder
       };
 
       recognitionRef.current = recognition;
@@ -544,8 +568,11 @@ export default function AiVoiceMic({
       if (feedbackTimerRef.current) {
         clearTimeout(feedbackTimerRef.current);
       }
+      if (liveTranscribeTimerRef.current) {
+        clearTimeout(liveTranscribeTimerRef.current);
+      }
     };
-  }, [useDirectAudio, selectedDeviceId]);
+  }, [selectedDeviceId]);
 
   // Process recognized command with Gemini AI
   const executeVoiceCommand = async (textToProcess, audioBlob = null) => {
@@ -764,6 +791,21 @@ export default function AiVoiceMic({
     }
   };
 
+  // Process stopping recording and submitting command
+  const handleDoneAndRun = () => {
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    } else {
+      stopAudioVisualizer();
+      setListening(false);
+      const cmd = (transcript || manualCmd).trim();
+      if (cmd) executeVoiceCommand(cmd);
+    }
+  };
+
   // Toggle microphone recording
   const toggleListening = async () => {
     setError('');
@@ -773,43 +815,25 @@ export default function AiVoiceMic({
 
     // If currently listening, stop and process
     if (listening) {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-      }
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
-      }
-      setListening(false);
-
-      if (transcript.trim()) {
-        executeVoiceCommand(transcript.trim());
-      }
+      handleDoneAndRun();
       return;
     }
 
     // Start listening
     setTranscript('');
+    setManualCmd('');
 
-    if (useDirectAudio) {
-      return startMediaRecorder();
-    }
+    // ALWAYS start MediaRecorder on the selected headset/microphone stream
+    startMediaRecorder();
 
+    // In parallel, start SpeechRecognition if available
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start();
-        return;
       } catch (err) {
-        console.warn('SpeechRecognition start failed, switching to MediaRecorder:', err);
-        return startMediaRecorder();
+        console.warn('SpeechRecognition parallel start notice:', err);
       }
     }
-
-    // Fallback: MediaRecorder
-    return startMediaRecorder();
   };
 
   return (
@@ -916,11 +940,15 @@ export default function AiVoiceMic({
                 Actively Writing What Is Recorded
               </span>
               <span style={{ color: voiceDetected ? '#4ade80' : 'var(--muted)', fontWeight: 600 }}>
-                {voiceDetected ? '🟢 Receiving Voice' : '🎙️ Speak Now'}
+                {voiceDetected ? '🟢 Hearing Voice...' : '🎙️ Speak Now'}
               </span>
             </div>
             <div className={`ai-active-text ${!transcript && !manualCmd ? 'placeholder' : ''}`}>
-              {transcript || manualCmd || 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…'}
+              {transcript ||
+                manualCmd ||
+                (voiceDetected
+                  ? '🟢 Hearing your headset voice... Transcribing...'
+                  : 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…')}
               <span className="ai-blinking-cursor">|</span>
             </div>
           </div>
@@ -930,18 +958,7 @@ export default function AiVoiceMic({
               type="button"
               className="pill primary"
               style={{ padding: '5px 14px', fontSize: 12, fontWeight: 600 }}
-              onClick={() => {
-                if (recognitionRef.current) {
-                  try { recognitionRef.current.stop(); } catch {}
-                }
-                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-                  mediaRecorderRef.current.stop();
-                }
-                stopAudioVisualizer();
-                setListening(false);
-                const cmd = (transcript || manualCmd).trim();
-                if (cmd) executeVoiceCommand(cmd);
-              }}
+              onClick={handleDoneAndRun}
             >
               Done & Run
             </button>

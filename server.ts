@@ -581,6 +581,51 @@ function ruleBasedParseCommand(speechText: string, currentDate: string, existing
   };
 }
 
+// API: Direct real-time audio transcription endpoint
+app.post('/api/transcribe-audio', async (req, res) => {
+  try {
+    const { audioBase64, mimeType } = req.body;
+    if (!audioBase64) {
+      return res.status(400).json({ error: 'No audioBase64 provided' });
+    }
+
+    const ai = getAiClient();
+    const audioPart = {
+      inlineData: {
+        mimeType: mimeType || 'audio/webm',
+        data: audioBase64,
+      },
+    };
+
+    const models = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    let transcribed = '';
+
+    for (const model of models) {
+      try {
+        const transRes = await ai.models.generateContent({
+          model,
+          contents: [
+            audioPart,
+            'Transcribe this voice command from a student planner verbatim. Return ONLY the plain words with no quotes or commentary.',
+          ],
+        });
+        const text = transRes.text?.trim().replace(/^["']|["']$/g, '') || '';
+        if (text) {
+          transcribed = text;
+          break;
+        }
+      } catch (err: any) {
+        console.warn(`[AI Server] /api/transcribe-audio with ${model} failed:`, err?.message || err);
+      }
+    }
+
+    return res.json({ success: Boolean(transcribed), transcript: transcribed });
+  } catch (err: any) {
+    console.error('Error in /api/transcribe-audio:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to transcribe audio' });
+  }
+});
+
 // API: Comprehensive AI Voice Command handler for controlling the entire website
 app.post('/api/parse-voice-command', async (req, res) => {
   try {
@@ -607,7 +652,7 @@ app.post('/api/parse-voice-command', async (req, res) => {
           },
         };
 
-        const transcribeModels = ['gemini-3.5-transcribe', 'gemini-2.5-flash', 'gemini-3.8-flash'];
+        const transcribeModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
         for (const m of transcribeModels) {
           try {
             const transRes = await ai.models.generateContent({
@@ -680,7 +725,7 @@ Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to
     }
 
     const ai = getAiClient();
-    const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+    const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
     let lastError: any = null;
 
     for (const model of modelsToTry) {
