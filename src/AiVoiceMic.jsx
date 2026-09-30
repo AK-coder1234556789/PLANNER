@@ -1,29 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { auth } from './firebase';
 
-// Sends the signed-in user's Firebase token so the server can verify who is calling
-async function authHeaders() {
-  const h = { 'Content-Type': 'application/json' };
-  try {
-    const t = await auth.currentUser?.getIdToken();
-    if (t) h.Authorization = 'Bearer ' + t;
-  } catch {}
-  return h;
-}
-
-// Optional Web Speech Synthesis for spoken confirmation
-function speakFeedback(text) {
+// SILENT AI: Speech synthesis completely disabled per user request
+function speakFeedback() {
   if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
     try {
       window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.05;
-      utterance.pitch = 1.0;
-      utterance.volume = 0.85;
-      window.speechSynthesis.speak(utterance);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 }
 
@@ -32,6 +14,14 @@ function clientParseVoiceCommand(speechText, currentDate, labels = []) {
   const textLower = speechText.toLowerCase().trim();
   const today = currentDate || new Date().toISOString().slice(0, 10);
   const labelNames = labels.map((l) => (typeof l === 'string' ? l : l.name));
+
+  // 0. Undo & Redo Actions
+  if (textLower === 'undo' || textLower === 'undo that' || textLower === 'undo action' || textLower === 'revert' || textLower.startsWith('undo ')) {
+    return { action: 'undo', feedback: 'Undoing last action…', payload: {} };
+  }
+  if (textLower === 'redo' || textLower === 'redo that' || textLower === 'redo action' || textLower.startsWith('redo ')) {
+    return { action: 'redo', feedback: 'Redoing action…', payload: {} };
+  }
 
   // 1. Navigation
   if (textLower.includes('calendar') || textLower.includes('month view')) {
@@ -253,6 +243,10 @@ export default function AiVoiceMic({
   currentDate,
   currentView,
   labels,
+  canUndo = false,
+  canRedo = false,
+  onUndo,
+  onRedo,
   onNavigateView,
   onDateChange,
   onAddTask,
@@ -275,6 +269,16 @@ export default function AiVoiceMic({
   const [feedback, setFeedback] = useState(null);
   const [error, setError] = useState('');
 
+  // Window toggle & Hold-to-record states
+  const [isWindowOpen, setIsWindowOpen] = useState(false);
+  const [isHolding, setIsHolding] = useState(false);
+  const holdTimerRef = useRef(null);
+  const pointerDownTimeRef = useRef(0);
+  const isHoldingActiveRef = useRef(false);
+
+  // In-flight fetch cancellation
+  const abortControllerRef = useRef(null);
+
   const [useDirectAudio, setUseDirectAudio] = useState(false);
   const [manualCmd, setManualCmd] = useState('');
 
@@ -291,7 +295,6 @@ export default function AiVoiceMic({
   const [hasReceivedSound, setHasReceivedSound] = useState(false);
   const [silenceDuration, setSilenceDuration] = useState(0);
   const [isTestingMic, setIsTestingMic] = useState(false);
-  const [sttStatus, setSttStatus] = useState('');
 
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
@@ -318,10 +321,6 @@ export default function AiVoiceMic({
   const isListeningRef = useRef(false);
   const isTranscribingRef = useRef(false);
   const liveTranscribeTimerRef = useRef(null);
-  const lastSrResultAtRef = useRef(0); // when browser speech last produced text
-  const serverSttBlockedRef = useRef(false); // /api/transcribe-audio unreachable or rate limited
-  const heardSpeechRef = useRef(false); // real speech heard in this recording
-  const autoFinishRef = useRef(null); // always points at the latest handleDoneAndRun
 
   // Load and enumerate all available microphone devices
   const loadAudioDevices = async () => {
@@ -388,9 +387,6 @@ export default function AiVoiceMic({
     liveTranscribeTimerRef.current = setTimeout(async () => {
       liveTranscribeTimerRef.current = null;
       if (isTranscribingRef.current || recordedSamplesRef.current.length < 8) return;
-      if (serverSttBlockedRef.current) return;
-      // Browser speech is already writing text: don't spend server quota
-      if (Date.now() - lastSrResultAtRef.current < 4000) return;
       isTranscribingRef.current = true;
       try {
         let totalLength = 0;
@@ -416,35 +412,24 @@ export default function AiVoiceMic({
 
         const res = await fetch('/api/transcribe-audio', {
           method: 'POST',
-          headers: await authHeaders(),
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ audioBase64: b64, mimeType: 'audio/wav' }),
         });
 
-        const ct = res.headers.get('content-type') || '';
-        if (res.ok && ct.includes('application/json')) {
+        if (res.ok) {
           const resData = await res.json();
           if (resData.success && resData.transcript) {
+            console.log('[Live Transcribe] Actively written text:', resData.transcript);
             setTranscript(resData.transcript);
             setManualCmd(resData.transcript);
-            setSttStatus('');
           }
-        } else if (res.status === 429) {
-          serverSttBlockedRef.current = true;
-          setTimeout(() => { serverSttBlockedRef.current = false; }, 30000);
-          setSttStatus('Too many requests. Live text paused; it will still transcribe when you press Done.');
-        } else if (res.status === 401) {
-          setSttStatus('Please sign in again, then retry the mic.');
-        } else {
-          // 404 / HTML page = the voice server is not deployed here
-          serverSttBlockedRef.current = true;
-          setSttStatus('Voice server not reachable (needs /api on your host). Live text is off.');
         }
       } catch (err) {
         console.warn('Live transcribe check notice:', err);
       } finally {
         isTranscribingRef.current = false;
       }
-    }, 3500);
+    }, 1100);
   };
 
   // Real-time audio analyzer using Web Audio API + PCM sample capture
@@ -513,7 +498,6 @@ export default function AiVoiceMic({
         setAudioLevel(level);
 
         if (level > 4) {
-          heardSpeechRef.current = true;
           setVoiceDetected(true);
           setHasReceivedSound(true);
           silenceCounterRef.current = 0;
@@ -521,11 +505,6 @@ export default function AiVoiceMic({
         } else {
           setVoiceDetected(false);
           silenceCounterRef.current += 1;
-          // Wispr-style hands-free: ~1.8s of quiet after you spoke = run it
-          if (heardSpeechRef.current && isListeningRef.current && silenceCounterRef.current === 110) {
-            heardSpeechRef.current = false;
-            if (autoFinishRef.current) autoFinishRef.current();
-          }
           if (silenceCounterRef.current % 30 === 0) {
             setSilenceDuration((prev) => prev + 0.5);
           }
@@ -656,8 +635,6 @@ export default function AiVoiceMic({
         }
         const text = full.trim();
         if (text) {
-          lastSrResultAtRef.current = Date.now();
-          setSttStatus('');
           setTranscript(text);
           setManualCmd(text);
         }
@@ -667,12 +644,6 @@ export default function AiVoiceMic({
         console.warn('SpeechRecognition notice:', event.error);
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please allow mic permissions in browser.');
-        } else if (event.error === 'audio-capture') {
-          setSttStatus("Browser speech can't open your mic. Set your headset as the default mic (Windows Sound settings and Chrome's mic setting).");
-        } else if (event.error === 'network') {
-          setSttStatus("Browser speech service unreachable (needs internet; Brave blocks it). Audio is still recorded and will be transcribed on Done.");
-        } else if (event.error === 'language-not-supported') {
-          setSttStatus('Browser speech does not support this language. Audio will be transcribed on Done.');
         }
       };
 
@@ -704,65 +675,77 @@ export default function AiVoiceMic({
     };
   }, [selectedDeviceId]);
 
-  // Process recognized command with Gemini AI
+  // Process recognized command with ultra-fast client-first execution and Gemini AI fallback
   const executeVoiceCommand = async (textToProcess, audioBlob = null) => {
-    if (!textToProcess && !audioBlob) return;
+    const cleanText = (textToProcess || '').trim();
+    if (!cleanText && !audioBlob) return;
     setAnalyzing(true);
     setError('');
 
     try {
-      let payload = {
-        currentDate: currentDate || new Date().toISOString().slice(0, 10),
-        currentView: currentView || 'day',
-        existingLabels: labels.map((l) => l.name),
-      };
-
-      if (audioBlob) {
-        const reader = new FileReader();
-        const base64Promise = new Promise((resolve) => {
-          reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
-        });
-        reader.readAsDataURL(audioBlob);
-        payload.audioBase64 = await base64Promise;
-        payload.mimeType = audioBlob.type || 'audio/wav';
-      } else {
-        payload.speechText = textToProcess;
-      }
-
       let commandData = null;
-      let serverReached = false;
 
-      // 1. Try server-side Gemini AI parser first
-      try {
-        const res = await fetch('/api/parse-voice-command', {
-          method: 'POST',
-          headers: await authHeaders(),
-          body: JSON.stringify(payload),
-        });
-
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const resData = await res.json();
-          serverReached = true;
-          if (resData && resData.success && resData.data) {
-            commandData = resData.data;
-          }
-        } else {
-          console.warn('Backend responded with non-JSON content:', res.status, contentType);
+      // 1. ULTRA-FAST PATH: Check client-side rules FIRST (instant < 5ms execution!)
+      if (cleanText) {
+        const clientMatch = clientParseVoiceCommand(cleanText, currentDate, labels);
+        if (clientMatch && clientMatch.action && clientMatch.action !== 'feedback_only') {
+          commandData = clientMatch;
         }
-      } catch (fetchErr) {
-        console.warn('Network call to /api/parse-voice-command failed, using client fallback:', fetchErr);
       }
 
-      // 2. If server didn't return data and we have text, run instant client-side parser
-      if (!commandData && textToProcess) {
-        commandData = clientParseVoiceCommand(textToProcess, currentDate, labels);
+      // 2. If client parser did not match (or we only have audio), call server Gemini AI parser
+      if (!commandData) {
+        let payload = {
+          currentDate: currentDate || new Date().toISOString().slice(0, 10),
+          currentView: currentView || 'day',
+          existingLabels: labels.map((l) => l.name),
+        };
+
+        if (audioBlob) {
+          const reader = new FileReader();
+          const base64Promise = new Promise((resolve) => {
+            reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
+          });
+          reader.readAsDataURL(audioBlob);
+          payload.audioBase64 = await base64Promise;
+          payload.mimeType = audioBlob.type || 'audio/wav';
+        }
+        if (cleanText) {
+          payload.speechText = cleanText;
+        }
+
+        const abortCtrl = new AbortController();
+        abortControllerRef.current = abortCtrl;
+
+        try {
+          const res = await fetch('/api/parse-voice-command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: abortCtrl.signal,
+          });
+
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const resData = await res.json();
+            if (resData && resData.success && resData.data) {
+              commandData = resData.data;
+            }
+          }
+        } catch (fetchErr) {
+          if (fetchErr.name === 'AbortError') {
+            console.log('Voice command fetch aborted by user');
+            return;
+          }
+          console.warn('Network call to /api/parse-voice-command failed:', fetchErr);
+        } finally {
+          abortControllerRef.current = null;
+        }
       }
 
       if (!commandData || commandData.action === 'feedback_only') {
-        const msg = commandData?.feedback || (!serverReached && !textToProcess ? 'Could not reach the voice server, so I could not transcribe. Type the command below or use a quick button.' : null) || "Could not hear clear speech. Try speaking closer to mic or pick a quick command below.";
+        const msg = commandData?.feedback || 'Could not understand command. Please try speaking again.';
         setFeedback({ message: msg });
-        speakFeedback(msg);
         return;
       }
 
@@ -799,7 +782,7 @@ export default function AiVoiceMic({
           if (onAddTask) {
             await onAddTask(
               p.section || 'lectures',
-              p.text || textToProcess,
+              p.text || cleanText,
               p.type || 'task',
               p.date || currentDate,
               p.labelName || null
@@ -810,14 +793,14 @@ export default function AiVoiceMic({
 
         case 'complete_task': {
           if (onCompleteTask) {
-            await onCompleteTask(p.targetQuery || textToProcess);
+            await onCompleteTask(p.targetQuery || cleanText);
           }
           break;
         }
 
         case 'delete_task': {
           if (onDeleteTask) {
-            await onDeleteTask(p.targetQuery || textToProcess);
+            await onDeleteTask(p.targetQuery || cleanText);
           }
           break;
         }
@@ -894,6 +877,26 @@ export default function AiVoiceMic({
           break;
         }
 
+        case 'undo': {
+          if (onUndo) {
+            const desc = await onUndo();
+            const msg = desc ? `↩ Undone: ${desc}` : 'Nothing to undo';
+            setFeedback({ message: msg });
+            return;
+          }
+          break;
+        }
+
+        case 'redo': {
+          if (onRedo) {
+            const desc = await onRedo();
+            const msg = desc ? `↪ Redone: ${desc}` : 'Nothing to redo';
+            setFeedback({ message: msg });
+            return;
+          }
+          break;
+        }
+
         case 'sign_out': {
           if (onSignOut) onSignOut();
           break;
@@ -901,23 +904,25 @@ export default function AiVoiceMic({
 
         default: {
           if (onAddTask) {
-            await onAddTask('lectures', textToProcess, 'task', currentDate, null);
+            await onAddTask('lectures', cleanText, 'task', currentDate, null);
           }
           break;
         }
       }
 
+      // Snappy silent visual feedback
       const msg = actionFeedback || 'Action executed!';
       setFeedback({ message: msg });
-      speakFeedback(msg);
+      speakFeedback(); // Silent: cancels any speech
 
-      // Auto dismiss feedback banner
+      // Auto-dismiss feedback in 2.2 seconds
       if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
       feedbackTimerRef.current = setTimeout(() => {
         setFeedback(null);
-      }, 4500);
+      }, 2200);
 
       setTranscript('');
+      setManualCmd('');
     } catch (err) {
       console.error('Voice command execution failed:', err);
       setError(err?.message || 'Could not understand command');
@@ -926,7 +931,40 @@ export default function AiVoiceMic({
     }
   };
 
-  // Process stopping recording and submitting command
+  // Start microphone recording session
+  const startListening = async () => {
+    setError('');
+    if (analyzing) return;
+    setTranscript('');
+    setManualCmd('');
+
+    startMediaRecorder();
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (err) {
+        console.warn('SpeechRecognition parallel start notice:', err);
+      }
+    }
+  };
+
+  // Cancel microphone recording session
+  const cancelListening = () => {
+    isListeningRef.current = false;
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      try { mediaRecorderRef.current.stop(); } catch {}
+    }
+    stopAudioVisualizer();
+    setListening(false);
+    setTranscript('');
+    setManualCmd('');
+  };
+
+  // Process stopping recording and submitting command immediately
   const handleDoneAndRun = (overrideText = '') => {
     isListeningRef.current = false;
     if (recognitionRef.current) {
@@ -953,65 +991,161 @@ export default function AiVoiceMic({
 
     stopAudioVisualizer();
     setListening(false);
-    const cmd = ((typeof overrideText === 'string' && overrideText) || transcript || manualCmd || '').trim();
+    const cmd = (overrideText || transcript || manualCmd).trim();
     executeVoiceCommand(cmd, finalWavBlob);
   };
 
-  // Toggle microphone recording
-  const toggleListening = async () => {
-    setError('');
+  // Single Click opens window; Holding records audio and acts on release [SILENTLY]
+  const handlePointerDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    pointerDownTimeRef.current = Date.now();
+    isHoldingActiveRef.current = false;
 
-    // If currently analyzing, do nothing
-    if (analyzing) return;
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+    }
 
-    // If currently listening, stop and process
-    if (listening) {
-      handleDoneAndRun();
+    // Pressing for > 200ms begins HOLD-TO-TALK recording
+    holdTimerRef.current = setTimeout(() => {
+      isHoldingActiveRef.current = true;
+      setIsHolding(true);
+      startListening();
+    }, 200);
+  };
+
+  const handlePointerUp = (e) => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+
+    const duration = Date.now() - pointerDownTimeRef.current;
+
+    // Single click (< 200ms): Toggle open/close the window
+    if (!isHoldingActiveRef.current && duration < 200) {
+      setIsWindowOpen((prev) => !prev);
       return;
     }
 
-    // Start listening
-    setTranscript('');
-    setManualCmd('');
-    setSttStatus('');
-    heardSpeechRef.current = false;
-    lastSrResultAtRef.current = 0;
-    serverSttBlockedRef.current = false;
-
-    // ALWAYS start MediaRecorder on the selected headset/microphone stream
-    startMediaRecorder();
-
-    // In parallel, start SpeechRecognition if available
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.start();
-      } catch (err) {
-        console.warn('SpeechRecognition parallel start notice:', err);
-      }
+    // Was holding: Release to act [SILENTLY]
+    if (isHoldingActiveRef.current) {
+      isHoldingActiveRef.current = false;
+      setIsHolding(false);
+      handleDoneAndRun();
     }
   };
 
-  // Keep latest handlers reachable from the audio loop and the keyboard shortcut
-  autoFinishRef.current = () => handleDoneAndRun();
-  const toggleRef = useRef(null);
-  toggleRef.current = toggleListening;
-  useEffect(() => {
-    // Alt+V starts/stops the mic from anywhere on the page
-    const onKey = (e) => {
-      if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyV') {
-        e.preventDefault();
-        if (toggleRef.current) toggleRef.current();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  const handlePointerCancelOrLeave = (e) => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+
+    if (isHoldingActiveRef.current) {
+      isHoldingActiveRef.current = false;
+      setIsHolding(false);
+      handleDoneAndRun();
+    }
+  };
+
+  // Dedicated Cancel handler to stop voice recording, discard audio, or abort in-flight AI processing
+  const handleCancelVoice = (e) => {
+    e?.stopPropagation();
+    e?.preventDefault();
+
+    if (abortControllerRef.current) {
+      try {
+        abortControllerRef.current.abort();
+      } catch {}
+      abortControllerRef.current = null;
+    }
+
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    isHoldingActiveRef.current = false;
+    setIsHolding(false);
+
+    cancelListening();
+    setAnalyzing(false);
+    setError('');
+    setTranscript('');
+    setManualCmd('');
+
+    setFeedback({ message: 'Voice action cancelled' });
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => {
+      setFeedback(null);
+    }, 1800);
+  };
+
+  const isWindowVisible = isWindowOpen || (listening && !isHolding);
 
   return (
     <div className="ai-voice-floating-container">
-      {/* Floating Action / Result Banner popping up right above bottom-right button */}
-      {listening && (
+      {/* Floating Hold-to-Talk Status Pill */}
+      {isHolding && (
+        <div className="ai-holding-banner">
+          <span className="ai-holding-dot" />
+          <span className="ai-holding-text">Listening... Release to Act</span>
+        </div>
+      )}
+
+      {/* Voice Controller Window popping up on Single Click */}
+      {isWindowVisible && (
         <div className="ai-voice-live-hud">
+          {/* Window Header with Title & Close button */}
+          <div className="ai-window-header">
+            <div className="ai-window-title">
+              <i className="ti ti-microphone" style={{ color: 'var(--accent)', fontSize: 16 }} />
+              <span>Voice Controller</span>
+              {listening && <span className="ai-dot-pulse" title="Recording active" />}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div className="undo-redo-group" style={{ padding: '1px 3px' }}>
+                <button
+                  type="button"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11 }}
+                  disabled={!canUndo}
+                  onClick={async () => {
+                    if (onUndo) {
+                      const desc = await onUndo();
+                      setFeedback({ message: desc ? `↩ Undone: ${desc}` : 'Undone' });
+                    }
+                  }}
+                  title="Undo last action (Ctrl+Z)"
+                >
+                  <i className="ti ti-arrow-back-up" />
+                </button>
+                <button
+                  type="button"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11 }}
+                  disabled={!canRedo}
+                  onClick={async () => {
+                    if (onRedo) {
+                      const desc = await onRedo();
+                      setFeedback({ message: desc ? `↪ Redone: ${desc}` : 'Redone' });
+                    }
+                  }}
+                  title="Redo last action (Ctrl+Y)"
+                >
+                  <i className="ti ti-arrow-forward-up" />
+                </button>
+              </div>
+              <button
+                type="button"
+                className="ai-window-close"
+                onClick={() => setIsWindowOpen(false)}
+                title="Close window"
+              >
+                <i className="ti ti-x" />
+              </button>
+            </div>
+          </div>
+
           {/* Microphone Device Selection */}
           <div className="ai-mic-select-container">
             <span className="ai-mic-select-label">
@@ -1061,7 +1195,9 @@ export default function AiVoiceMic({
                   ? 'Voice Audio Received'
                   : silenceDuration > 2.5
                   ? 'No Sound (Mic Muted/Silent)'
-                  : 'Listening (speak now)…'}
+                  : listening
+                  ? 'Listening (speak now)…'
+                  : 'Ready to listen'}
               </span>
               <span className="ai-mic-vol-label">{audioLevel}% level</span>
             </div>
@@ -1096,7 +1232,7 @@ export default function AiVoiceMic({
             </div>
 
             {/* Helpful warning if mic volume stays 0% */}
-            {silenceDuration > 3 && !hasReceivedSound && (
+            {silenceDuration > 3 && !hasReceivedSound && listening && (
               <div className="ai-mic-silent-warning">
                 ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or switch mic above.
               </div>
@@ -1104,122 +1240,99 @@ export default function AiVoiceMic({
           </div>
 
           {/* Real-Time Actively Written Transcription Box */}
-          <div className="ai-active-transcription-card recording">
+          <div className={`ai-active-transcription-card ${listening ? 'recording' : ''}`}>
             <div className="ai-active-header">
               <span>
-                <span className="ai-active-live-dot" />
-                Actively Writing What Is Recorded
+                <span className="ai-active-live-dot" style={{ opacity: listening ? 1 : 0.4 }} />
+                Actively Writing Speech
               </span>
               <span style={{ color: voiceDetected ? '#4ade80' : 'var(--muted)', fontWeight: 600 }}>
-                {voiceDetected ? '🟢 Hearing Voice...' : '🎙️ Speak Now'}
+                {voiceDetected ? '🟢 Hearing Voice...' : listening ? '🎙️ Speak Now' : 'Idle'}
               </span>
             </div>
             <div className={`ai-active-text ${!transcript && !manualCmd ? 'placeholder' : ''}`}>
               {transcript ||
                 manualCmd ||
-                (voiceDetected
-                  ? (sttStatus || '🟢 Hearing your voice… text appears as it is recognised')
-                  : 'Say anything: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…')}
-              <span className="ai-blinking-cursor">|</span>
+                (listening
+                  ? voiceDetected
+                    ? '🟢 Hearing your voice... Transcribing...'
+                    : 'Speak now: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…'
+                  : 'Click "Speak Command" below or hold the toggle to talk…')}
+              {listening && <span className="ai-blinking-cursor">|</span>}
             </div>
           </div>
 
+          {/* Action Buttons & Undo/Redo */}
           <div className="ai-live-actions">
-            <button
-              type="button"
-              className="pill primary"
-              style={{ padding: '5px 14px', fontSize: 12, fontWeight: 600 }}
-              onClick={handleDoneAndRun}
-            >
-              Done & Run
-            </button>
+            {listening ? (
+              <>
+                <button
+                  type="button"
+                  className="pill primary"
+                  style={{ padding: '5px 14px', fontSize: 12, fontWeight: 600 }}
+                  onClick={() => handleDoneAndRun()}
+                >
+                  Done & Run
+                </button>
+                <button
+                  type="button"
+                  className="muted"
+                  style={{ fontSize: 12, padding: '5px 10px' }}
+                  onClick={cancelListening}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="pill primary"
+                style={{ padding: '6px 14px', fontSize: 12, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                onClick={startListening}
+              >
+                <i className="ti ti-microphone" /> Speak Command
+              </button>
+            )}
+
+            <div className="undo-redo-group" style={{ marginLeft: 'auto' }}>
+              <button
+                type="button"
+                className="undo-redo-btn"
+                disabled={!canUndo}
+                onClick={async () => {
+                  if (onUndo) {
+                    const desc = await onUndo();
+                    setFeedback({ message: desc ? `↩ Undone: ${desc}` : 'Nothing to undo' });
+                  }
+                }}
+                title="Undo last action (Ctrl+Z)"
+              >
+                <i className="ti ti-arrow-back-up" /> Undo
+              </button>
+              <button
+                type="button"
+                className="undo-redo-btn"
+                disabled={!canRedo}
+                onClick={async () => {
+                  if (onRedo) {
+                    const desc = await onRedo();
+                    setFeedback({ message: desc ? `↪ Redone: ${desc}` : 'Nothing to redo' });
+                  }
+                }}
+                title="Redo action (Ctrl+Y)"
+              >
+                <i className="ti ti-arrow-forward-up" /> Redo
+              </button>
+            </div>
+
             <button
               type="button"
               className="muted"
-              style={{ fontSize: 12, padding: '5px 10px' }}
-              onClick={() => {
-                if (recognitionRef.current) {
-                  try { recognitionRef.current.stop(); } catch {}
-                }
-                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-                  mediaRecorderRef.current.stop();
-                }
-                stopAudioVisualizer();
-                setListening(false);
-                setTranscript('');
-                setManualCmd('');
-              }}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="muted"
-              style={{ fontSize: 11, padding: '4px 8px', marginLeft: 'auto' }}
+              style={{ fontSize: 11, padding: '4px 8px' }}
               onClick={toggleTestMic}
               title="Test microphone input level"
             >
               <i className="ti ti-tool" style={{ marginRight: 3 }} /> Test Mic
-            </button>
-          </div>
-
-          {/* Quick Tap Command Suggestions */}
-          <div className="ai-quick-command-row">
-            <span className="ai-quick-label">Tap to run:</span>
-            <button
-              type="button"
-              className="ai-quick-chip"
-              onClick={() => {
-                setTranscript('Go to Calendar');
-                setManualCmd('Go to Calendar');
-                handleDoneAndRun('Go to Calendar');
-              }}
-            >
-              📅 Calendar
-            </button>
-            <button
-              type="button"
-              className="ai-quick-chip"
-              onClick={() => {
-                setTranscript('Add Optics to Lectures');
-                setManualCmd('Add Optics to Lectures');
-                handleDoneAndRun('Add Optics to Lectures');
-              }}
-            >
-              📚 Add Optics
-            </button>
-            <button
-              type="button"
-              className="ai-quick-chip"
-              onClick={() => {
-                setTranscript('Mark optics done');
-                setManualCmd('Mark optics done');
-                handleDoneAndRun('Mark optics done');
-              }}
-            >
-              ✅ Mark Done
-            </button>
-            <button
-              type="button"
-              className="ai-quick-chip"
-              onClick={() => {
-                setTranscript('Wallpaper dusk');
-                setManualCmd('Wallpaper dusk');
-                handleDoneAndRun('Wallpaper dusk');
-              }}
-            >
-              🎨 Dusk
-            </button>
-            <button
-              type="button"
-              className="ai-quick-chip"
-              onClick={() => {
-                setTranscript('View Targets');
-                setManualCmd('View Targets');
-                handleDoneAndRun('View Targets');
-              }}
-            >
-              🎯 Targets
             </button>
           </div>
 
@@ -1230,15 +1343,8 @@ export default function AiVoiceMic({
               e.preventDefault();
               const cmd = (manualCmd || transcript).trim();
               if (cmd) {
-                if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
-                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-                  mediaRecorderRef.current.stop();
-                }
-                stopAudioVisualizer();
-                setListening(false);
+                cancelListening();
                 executeVoiceCommand(cmd);
-                setManualCmd('');
-                setTranscript('');
               }
             }}
           >
@@ -1248,7 +1354,7 @@ export default function AiVoiceMic({
                 setManualCmd(e.target.value);
                 setTranscript(e.target.value);
               }}
-              placeholder="Actively written words appear here (or type to edit)…"
+              placeholder="Type or edit command to execute…"
               style={{ flex: 1, padding: '6px 9px', fontSize: 12, borderRadius: 8, background: '#1c1c20', color: '#fff', border: '1px solid #3f3f46' }}
             />
             <button type="submit" className="pill" style={{ padding: '6px 12px', fontSize: 11 }}>
@@ -1371,7 +1477,7 @@ export default function AiVoiceMic({
         <div className="ai-voice-live-hud analyzing">
           <div className="ai-analyzing-content">
             <i className="ti ti-sparkles ai-spin" style={{ color: 'var(--accent)', fontSize: 20 }} />
-            <span>Analyzing command with Gemini AI…</span>
+            <span>Executing action…</span>
           </div>
         </div>
       )}
@@ -1405,13 +1511,34 @@ export default function AiVoiceMic({
         </div>
       )}
 
+      {/* Cancel button that shows up while processing or capturing voice, positioned just adjacent */}
+      {(analyzing || listening || isHolding) && (
+        <button
+          type="button"
+          className="ai-voice-cancel-btn"
+          onClick={handleCancelVoice}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+          }}
+          title="Cancel voice processing"
+          aria-label="Cancel voice processing"
+        >
+          <i className="ti ti-x" />
+          <span>Cancel</span>
+        </button>
+      )}
+
       {/* SUITABLY ENLARGED FLOATING MIC TOGGLE (NO TEXT) IN BOTTOM RIGHT */}
       <button
         type="button"
         id="ai-voice-fab"
-        className={`ai-fab-mic-btn ${listening ? 'listening' : ''} ${analyzing ? 'analyzing' : ''}`}
-        title={listening ? 'Click to finish speaking' : analyzing ? 'AI is processing command…' : 'Toggle Voice Controller (Control the entire website with your voice)'}
-        onClick={toggleListening}
+        className={`ai-fab-mic-btn ${(listening || isHolding) ? 'listening' : ''} ${isHolding ? 'holding' : ''} ${analyzing ? 'analyzing' : ''}`}
+        title="Click once to open window, or hold to record and speak"
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerCancelOrLeave}
+        onPointerCancel={handlePointerCancelOrLeave}
+        onContextMenu={(e) => e.preventDefault()}
         disabled={analyzing}
         aria-label="Voice Controller"
       >
@@ -1419,11 +1546,11 @@ export default function AiVoiceMic({
           {analyzing ? (
             <i className="ti ti-sparkles ai-spin" />
           ) : (
-            <i className={listening ? 'ti ti-microphone' : 'ti ti-microphone'} />
+            <i className="ti ti-microphone" />
           )}
         </div>
 
-        {listening && (
+        {(listening || isHolding) && (
           <span className="ai-fab-ripples">
             <span className="ai-ripple-1" />
             <span className="ai-ripple-2" />

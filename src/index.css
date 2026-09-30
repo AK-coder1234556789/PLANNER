@@ -159,17 +159,28 @@ details{margin-top:10px;color:var(--muted)}
 .mini .label-del-btn{display:none}
 
 /* SUITABLY ENLARGED FLOATING MIC TOGGLE (NO TEXT) IN BOTTOM RIGHT */
-.ai-voice-floating-container{position:fixed;bottom:24px;right:24px;left:auto;z-index:1000}
-.ai-fab-mic-btn{position:relative;width:58px;height:58px;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--accent) 26%,#151518);border:2px solid color-mix(in srgb,var(--accent) 70%,transparent);color:var(--accent);cursor:pointer;box-shadow:0 8px 32px #00000099,0 0 20px color-mix(in srgb,var(--accent) 35%,transparent);transition:transform .35s var(--spring),background .3s,border-color .3s,box-shadow .3s}
-.ai-fab-mic-btn:hover{transform:scale(1.1);background:color-mix(in srgb,var(--accent) 38%,#1a1a1f);border-color:var(--accent);box-shadow:0 12px 40px #000000cc,0 0 30px color-mix(in srgb,var(--accent) 60%,transparent)}
-.ai-fab-mic-btn:active{transform:scale(0.94)}
-.ai-fab-icon-wrap{font-size:26px;display:grid;place-items:center}
+.ai-voice-floating-container{position:fixed;bottom:24px;right:24px;left:auto;z-index:1000;pointer-events:none;display:flex;align-items:center;gap:10px}
+.ai-fab-mic-btn{position:relative;width:58px;height:58px;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--accent) 26%,#151518);border:2px solid color-mix(in srgb,var(--accent) 70%,transparent);color:var(--accent);cursor:pointer;box-shadow:0 8px 32px #00000099,0 0 20px color-mix(in srgb,var(--accent) 35%,transparent);transition:transform .2s var(--spring),background .2s,border-color .2s,box-shadow .2s;pointer-events:auto;user-select:none;-webkit-user-select:none;touch-action:none;flex-shrink:0}
+.ai-fab-mic-btn:hover{transform:scale(1.08);background:color-mix(in srgb,var(--accent) 38%,#1a1a1f);border-color:var(--accent);box-shadow:0 12px 40px #000000cc,0 0 30px color-mix(in srgb,var(--accent) 60%,transparent)}
+.ai-fab-mic-btn:active{transform:scale(0.95)}
+.ai-fab-icon-wrap{font-size:26px;display:grid;place-items:center;pointer-events:none}
 
-.ai-fab-mic-btn.listening{background:color-mix(in srgb,#ef4444 30%,#151518);border-color:#ef4444;color:#fca5a5;box-shadow:0 0 34px color-mix(in srgb,#ef4444 70%,transparent);animation:fab-pulse 1.35s infinite}
+/* Adjacent Cancel button that shows up while processing or capturing voice */
+.ai-voice-cancel-btn{background:#18181df2;backdrop-filter:blur(18px);border:1.5px solid #ef444499;color:#fca5a5;padding:9px 16px;border-radius:999px;font-size:12px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 8px 24px #000000aa;animation:pop .22s var(--spring) both;pointer-events:auto;user-select:none;-webkit-user-select:none;transition:all .18s ease;white-space:nowrap}
+.ai-voice-cancel-btn:hover{background:#ef444428;border-color:#ef4444;color:#fff;transform:scale(1.05)}
+.ai-voice-cancel-btn:active{transform:scale(0.95)}
+
+/* Global Undo / Redo toolbar controls */
+.undo-redo-group{display:inline-flex;align-items:center;background:#18181be6;border:1px solid #27272a;border-radius:10px;padding:2px;gap:2px}
+.undo-redo-btn{background:transparent;border:none;color:var(--text);padding:5px 11px;border-radius:8px;font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:5px;cursor:pointer;transition:all .15s ease}
+.undo-redo-btn:hover:not(:disabled){background:#27272a;color:#fff}
+.undo-redo-btn:disabled{opacity:0.35;cursor:default}
+
+.ai-fab-mic-btn.listening,.ai-fab-mic-btn.holding{background:color-mix(in srgb,#ef4444 32%,#151518);border-color:#ef4444;color:#fca5a5;box-shadow:0 0 36px color-mix(in srgb,#ef4444 75%,transparent);animation:fab-pulse 1.2s infinite;transform:scale(1.12)}
 .ai-fab-mic-btn.analyzing{background:color-mix(in srgb,var(--accent) 45%,#18181c);border-color:var(--accent);color:#fff}
 
 @keyframes fab-pulse{
-  0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,#ef4444 55%,transparent),0 8px 30px #000000aa}
+  0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,#ef4444 60%,transparent),0 8px 30px #000000aa}
   50%{box-shadow:0 0 0 16px transparent,0 8px 30px #000000aa}
 }
 
@@ -181,16 +192,21 @@ details{margin-top:10px;color:var(--muted)}
   100%{transform:scale(1.6);opacity:0}
 }
 
-/* Floating live HUD popping up above the mic in bottom right */
-.ai-voice-live-hud{position:absolute;bottom:72px;right:0;left:auto;min-width:280px;max-width:360px;background:#16161af4;backdrop-filter:blur(22px);border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);border-radius:18px;padding:14px;display:grid;gap:10px;box-shadow:0 16px 42px #000000cc;animation:pop .4s var(--spring) both;z-index:1001}
+/* Floating live HUD window popping up above the mic in bottom right */
+.ai-voice-live-hud{position:absolute;bottom:72px;right:0;left:auto;min-width:300px;max-width:380px;background:#16161af8;backdrop-filter:blur(24px);border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);border-radius:18px;padding:14px;display:grid;gap:10px;box-shadow:0 20px 48px #000000dd;animation:pop .3s var(--spring) both;z-index:1001;pointer-events:auto}
 .ai-voice-live-hud.analyzing{border-color:var(--accent)}
-.ai-voice-live-hud.feedback{border-color:#22c55e66;background:color-mix(in srgb,#22c55e 12%,#16161af4)}
-.ai-voice-live-hud.error{border-color:#ef444466;background:color-mix(in srgb,#ef4444 12%,#16161af4);color:#f87171;display:flex;align-items:center;gap:8px;font-size:12px}
+.ai-voice-live-hud.feedback{border-color:#22c55e66;background:color-mix(in srgb,#22c55e 14%,#16161af8)}
+.ai-voice-live-hud.error{border-color:#ef444466;background:color-mix(in srgb,#ef4444 14%,#16161af8);color:#f87171;display:flex;align-items:center;gap:8px;font-size:12px}
+
+.ai-window-header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #27272a;padding-bottom:8px}
+.ai-window-title{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#f4f4f5}
+.ai-window-close{background:none;border:none;color:var(--muted);cursor:pointer;padding:4px 6px;border-radius:6px;font-size:14px;display:grid;place-items:center;transition:color .15s,background .15s}
+.ai-window-close:hover{color:#fff;background:#27272a}
 
 .ai-listening-indicator{display:flex;align-items:center;gap:8px;font-size:12px;color:#fca5a5}
 .ai-dot-pulse{width:8px;height:8px;border-radius:50%;background:#ef4444;animation:pulse 0.9s infinite}
 .ai-transcript-preview{font-size:13px;color:var(--text);font-style:italic;background:#0c0c0e99;padding:9px 12px;border-radius:10px;min-height:36px;display:flex;align-items:center;line-height:1.4}
-.ai-live-actions{display:flex;gap:10px;align-items:center}
+.ai-live-actions{display:flex;gap:8px;align-items:center}
 .ai-analyzing-content{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text)}
 .ai-feedback-header{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;color:#f4f4f5}
 .ai-feedback-text{flex:1;word-break:break-word}
@@ -233,11 +249,14 @@ details{margin-top:10px;color:var(--muted)}
 .ai-blinking-cursor{display:inline-block;color:#4ade80;font-weight:bold;margin-left:2px;animation:blink 0.8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 
-/* Quick voice action chips in the tray */
-.ai-quick-command-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding-top:2px}
-.ai-quick-label{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:600;margin-right:2px}
-.ai-quick-chip{background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:999px;padding:3px 8px;font-size:11px;cursor:pointer;transition:all 0.15s ease}
-.ai-quick-chip:hover{background:var(--accent);color:#fff;border-color:var(--accent);transform:translateY(-1px)}
+/* Hold-to-record floating pill indicator */
+.ai-holding-banner{position:absolute;bottom:72px;right:0;background:#18181bf0;backdrop-filter:blur(16px);border:1.5px solid #ef4444;color:#fca5a5;padding:8px 16px;border-radius:999px;display:flex;align-items:center;gap:9px;font-size:12px;font-weight:600;white-space:nowrap;box-shadow:0 8px 30px #000000cc;animation:pop .25s var(--spring) both;pointer-events:none;z-index:1002}
+.ai-holding-dot{width:8px;height:8px;border-radius:50%;background:#ef4444;animation:pulse 0.8s infinite;box-shadow:0 0 8px #ef4444}
+.ai-holding-text{color:#fff;font-weight:600}
+
+/* Floating Undo/Redo Action Notification Toast */
+.undo-toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#18181df8;backdrop-filter:blur(20px);border:1px solid #3f3f46;color:#f4f4f5;padding:8px 18px;border-radius:999px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;box-shadow:0 12px 36px #000000aa;z-index:9999;animation:pop .22s var(--spring) both;pointer-events:none}
+
 
 
 

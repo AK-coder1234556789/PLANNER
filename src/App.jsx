@@ -206,18 +206,38 @@ function Countdown({ t, cd, go }) {
   return <div className={'card cd ' + cd.size}><div className="muted">{t.name}</div><div className="big" style={{ color: d < 0 ? '#ef4444' : cd.color }}>{val}</div></div>;
 }
 
-function Targets({ targets, base }) {
+function Targets({ targets, base, onAdd, onPin, onDelete, undoRedoGroup }) {
   const [n, setN] = useState(''); const [d, setD] = useState(''); const [note, setNote] = useState('');
   const add = (e) => {
     e.preventDefault();
     if (!n.trim() || !d) return;
-    addDoc(collection(db, ...base, 'targets'), { name: n.trim(), deadline: d, note: note.trim(), pinned: false, createdAt: Date.now() });
+    if (onAdd) {
+      onAdd(n.trim(), d, note.trim());
+    } else {
+      addDoc(collection(db, ...base, 'targets'), { name: n.trim(), deadline: d, note: note.trim(), pinned: false, createdAt: Date.now() });
+    }
     setN(''); setD(''); setNote('');
   };
-  const pin = (id) => targets.forEach((t) => updateDoc(doc(db, ...base, 'targets', t.id), { pinned: t.id === id ? !t.pinned : false }));
+  const pin = (t) => {
+    if (onPin) {
+      onPin(t.name);
+    } else {
+      targets.forEach((x) => updateDoc(doc(db, ...base, 'targets', x.id), { pinned: x.id === t.id ? !t.pinned : false }));
+    }
+  };
+  const del = (t) => {
+    if (onDelete) {
+      onDelete(t.name);
+    } else {
+      deleteDoc(doc(db, ...base, 'targets', t.id));
+    }
+  };
   return (
     <div>
-      <h2>Targets</h2>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 10 }}>
+        <h2>Targets</h2>
+        {undoRedoGroup}
+      </div>
       <form className="card tform" onSubmit={add}>
         <input value={n} onChange={(e) => setN(e.target.value)} placeholder="Target, e.g. Finish mechanics" />
         <input type="date" value={d} onChange={(e) => setD(e.target.value)} />
@@ -231,8 +251,8 @@ function Targets({ targets, base }) {
           <div className="card trow" key={t.id}>
             <div><b>{t.name}</b><div className="muted">{t.deadline}{t.note && ' · ' + t.note}</div></div>
             <span style={{ color: d < 0 ? '#ef4444' : 'var(--accent)' }}>{d < 0 ? `${-d} days over` : `${d} days left`}</span>
-            <button title="Show on countdown card" style={{ color: t.pinned ? 'var(--accent)' : undefined }} onClick={() => pin(t.id)}><i className={'ti ' + (t.pinned ? 'ti-pinned' : 'ti-pin')} /></button>
-            <button title="Delete" onClick={() => deleteDoc(doc(db, ...base, 'targets', t.id))}><i className="ti ti-trash" /></button>
+            <button title="Show on countdown card" style={{ color: t.pinned ? 'var(--accent)' : undefined }} onClick={() => pin(t)}><i className={'ti ' + (t.pinned ? 'ti-pinned' : 'ti-pin')} /></button>
+            <button title="Delete" onClick={() => del(t)}><i className="ti ti-trash" /></button>
           </div>
         );
       })}
@@ -250,6 +270,76 @@ function Main({ user }) {
   const [s, setS] = useState(DEF);
   const [date, setDate] = useState(iso(new Date())); const [view, setView] = useState('day');
   const [open, setOpen] = useState(false); const [nl, setNl] = useState('');
+
+  // Undo and Redo Action History Stacks
+  const [undoStack, setUndoStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);
+  const [undoToast, setUndoToast] = useState(null);
+  const undoToastTimerRef = useRef(null);
+
+  const showUndoToast = (msg) => {
+    setUndoToast(msg);
+    if (undoToastTimerRef.current) clearTimeout(undoToastTimerRef.current);
+    undoToastTimerRef.current = setTimeout(() => setUndoToast(null), 2500);
+  };
+
+  const pushAction = (actionRecord) => {
+    setUndoStack((prev) => [...prev.slice(-30), actionRecord]);
+    setRedoStack([]); // reset redo stack when a new action is performed
+  };
+
+  const handleUndo = async () => {
+    if (!undoStack.length) return false;
+    const action = undoStack[undoStack.length - 1];
+    setUndoStack((prev) => prev.slice(0, -1));
+    setRedoStack((prev) => [...prev, action]);
+    try {
+      await action.undo();
+      const desc = action.description || 'Action undone';
+      showUndoToast(`↩ Undone: ${desc}`);
+      return desc;
+    } catch (err) {
+      console.error('Failed to undo:', err);
+      return false;
+    }
+  };
+
+  const handleRedo = async () => {
+    if (!redoStack.length) return false;
+    const action = redoStack[redoStack.length - 1];
+    setRedoStack((prev) => prev.slice(0, -1));
+    setUndoStack((prev) => [...prev, action]);
+    try {
+      await action.redo();
+      const desc = action.description || 'Action redone';
+      showUndoToast(`↪ Redone: ${desc}`);
+      return desc;
+    } catch (err) {
+      console.error('Failed to redo:', err);
+      return false;
+    }
+  };
+
+  // Global Keyboard Shortcuts (Ctrl+Z for Undo, Ctrl+Y or Ctrl+Shift+Z for Redo)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      const tag = e.target.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        handleRedo();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [undoStack, redoStack]);
 
   useEffect(() => {
     const sub = (n, f) => onSnapshot(collection(db, ...base, n), { includeMetadataChanges: true }, (q) => {
@@ -270,135 +360,326 @@ function Main({ user }) {
 
   const save = (p) => { const n = { ...s, ...p }; setS(n); setDoc(doc(db, ...base, 'settings', 'profile'), n); };
   const saveCd = (p) => save({ cd: { ...s.cd, ...p } });
-  const add = (section, text, type, taskDate = date, labelName = null) => {
+
+  const add = async (section, text, type = 'task', taskDate = date, labelName = null, isUndoRedo = false) => {
     if (!text?.trim()) return;
     let labelIds = [];
     if (labelName) {
       const match = labels.find((l) => l.name.toLowerCase() === labelName.toLowerCase());
       if (match) labelIds = [match.id];
     }
-    return addDoc(collection(db, ...base, 'tasks'), {
-      text: text.trim(),
+    const cleanText = text.trim();
+    const taskData = {
+      text: cleanText,
       type: type || 'task',
       section: section || 'lectures',
       date: taskDate || date,
       done: false,
       labelIds,
       createdAt: Date.now(),
-    });
+    };
+    const docRef = await addDoc(collection(db, ...base, 'tasks'), taskData);
+    const newId = docRef.id;
+
+    if (!isUndoRedo) {
+      pushAction({
+        description: `Added "${cleanText}" to ${section}`,
+        undo: async () => {
+          await deleteDoc(doc(db, ...base, 'tasks', newId));
+        },
+        redo: async () => {
+          await setDoc(doc(db, ...base, 'tasks', newId), taskData);
+        },
+      });
+    }
+    return docRef;
   };
-  const upd = (id, p) => updateDoc(doc(db, ...base, 'tasks', id), p);
-  const del = (id) => deleteDoc(doc(db, ...base, 'tasks', id));
+
+  const upd = async (id, p, isUndoRedo = false) => {
+    const prevTask = tasks.find((t) => t.id === id);
+    await updateDoc(doc(db, ...base, 'tasks', id), p);
+
+    if (!isUndoRedo && prevTask) {
+      const prevPatch = {};
+      Object.keys(p).forEach((k) => {
+        prevPatch[k] = prevTask[k] !== undefined ? prevTask[k] : null;
+      });
+      const desc = p.done !== undefined
+        ? (p.done ? `Marked "${prevTask.text}" done` : `Marked "${prevTask.text}" active`)
+        : `Updated "${prevTask.text}"`;
+
+      pushAction({
+        description: desc,
+        undo: async () => {
+          await updateDoc(doc(db, ...base, 'tasks', id), prevPatch);
+        },
+        redo: async () => {
+          await updateDoc(doc(db, ...base, 'tasks', id), p);
+        },
+      });
+    }
+  };
+
+  const del = async (id, isUndoRedo = false) => {
+    const prevTask = tasks.find((t) => t.id === id);
+    if (!prevTask) return;
+    const { id: _, ...taskData } = prevTask;
+    await deleteDoc(doc(db, ...base, 'tasks', id));
+
+    if (!isUndoRedo) {
+      pushAction({
+        description: `Deleted "${prevTask.text}"`,
+        undo: async () => {
+          await setDoc(doc(db, ...base, 'tasks', id), taskData);
+        },
+        redo: async () => {
+          await deleteDoc(doc(db, ...base, 'tasks', id));
+        },
+      });
+    }
+  };
+
   const shift = (n) => { const d = new Date(date + 'T00:00'); d.setDate(d.getDate() + n); setDate(iso(d)); };
 
-  // Label management with deletion
-  const addLabel = (name) => {
-    if (!name?.trim()) return;
-    return addDoc(collection(db, ...base, 'labels'), { name: name.trim() });
+  const changeDateVoice = (targetDate, isUndoRedo = false) => {
+    const prevDate = date;
+    setDate(targetDate);
+    if (!isUndoRedo && prevDate !== targetDate) {
+      pushAction({
+        description: `Changed date to ${targetDate}`,
+        undo: async () => setDate(prevDate),
+        redo: async () => setDate(targetDate),
+      });
+    }
   };
 
-  const delLabel = async (id, name) => {
+  const navigateViewVoice = (targetView, isUndoRedo = false) => {
+    const prevView = view;
+    setView(targetView);
+    if (!isUndoRedo && prevView !== targetView) {
+      pushAction({
+        description: `Switched to ${targetView} view`,
+        undo: async () => setView(prevView),
+        redo: async () => setView(targetView),
+      });
+    }
+  };
+
+  // Label management with deletion and undo/redo
+  const addLabel = async (name, isUndoRedo = false) => {
+    if (!name?.trim()) return;
+    const cleanName = name.trim();
+    const docRef = await addDoc(collection(db, ...base, 'labels'), { name: cleanName });
+    const newId = docRef.id;
+
+    if (!isUndoRedo) {
+      pushAction({
+        description: `Added label "${cleanName}"`,
+        undo: async () => {
+          await deleteDoc(doc(db, ...base, 'labels', newId));
+        },
+        redo: async () => {
+          await setDoc(doc(db, ...base, 'labels', newId), { name: cleanName });
+        },
+      });
+    }
+    return docRef;
+  };
+
+  const delLabel = async (id, name, isUndoRedo = false) => {
     if (!id) return;
     try {
+      const affectedTasks = tasks.filter((t) => t.labelIds?.includes(id));
       await deleteDoc(doc(db, ...base, 'labels', id));
-      // Remove this label ID from any tasks that have it
-      tasks
-        .filter((t) => t.labelIds?.includes(id))
-        .forEach((t) => {
-          updateDoc(doc(db, ...base, 'tasks', t.id), { labelIds: arrayRemove(id) });
-        });
+      affectedTasks.forEach((t) => {
+        updateDoc(doc(db, ...base, 'tasks', t.id), { labelIds: arrayRemove(id) });
+      });
       if (view === 'label:' + id) {
         setView('day');
+      }
+
+      if (!isUndoRedo) {
+        pushAction({
+          description: `Removed label "${name}"`,
+          undo: async () => {
+            await setDoc(doc(db, ...base, 'labels', id), { name });
+            affectedTasks.forEach((t) => {
+              updateDoc(doc(db, ...base, 'tasks', t.id), { labelIds: arrayUnion(id) });
+            });
+          },
+          redo: async () => {
+            await delLabel(id, name, true);
+          },
+        });
       }
     } catch (e) {
       console.error('Failed to delete label:', e);
     }
   };
 
-  // Voice command handlers across all application features
-  const completeTaskVoice = async (query) => {
+  const completeTaskVoice = async (query, isUndoRedo = false) => {
+    if (!query) return;
     const qLower = query.toLowerCase().trim();
-    if (qLower === 'all' || qLower === 'all tasks' || qLower === 'everything') {
-      const dayTasks = tasks.filter((t) => t.date === date && !t.done);
-      for (const t of dayTasks) {
-        await upd(t.id, { done: true });
-      }
-      return;
-    }
-    const matched = tasks.find((t) => t.text.toLowerCase().includes(qLower));
+    const matched = tasks.find((t) => t.date === date && !t.done && t.text.toLowerCase().includes(qLower)) ||
+                    tasks.find((t) => !t.done && t.text.toLowerCase().includes(qLower)) ||
+                    tasks.find((t) => t.text.toLowerCase().includes(qLower));
     if (matched) {
-      await upd(matched.id, { done: true });
+      await upd(matched.id, { done: true }, isUndoRedo);
     }
   };
 
-  const deleteTaskVoice = async (query) => {
+  const deleteTaskVoice = async (query, isUndoRedo = false) => {
+    if (!query) return;
     const qLower = query.toLowerCase().trim();
-    const matched = tasks.find((t) => t.text.toLowerCase().includes(qLower));
+    const matched = tasks.find((t) => t.date === date && t.text.toLowerCase().includes(qLower)) ||
+                    tasks.find((t) => t.text.toLowerCase().includes(qLower));
     if (matched) {
-      await del(matched.id);
+      await del(matched.id, isUndoRedo);
     }
   };
 
-  const addTargetVoice = async (name, deadline, note) => {
+  const addTargetVoice = async (name, deadline, note = '', isUndoRedo = false) => {
     if (!name?.trim()) return;
-    await addDoc(collection(db, ...base, 'targets'), {
-      name: name.trim(),
-      deadline: deadline || date,
-      note: note || '',
-      pinned: false,
-      createdAt: Date.now(),
-    });
+    const cleanName = name.trim();
+    const cleanDeadline = deadline || date;
+    const cleanNote = (note || '').trim();
+    const targetData = { name: cleanName, deadline: cleanDeadline, note: cleanNote, pinned: false, createdAt: Date.now() };
+    const docRef = await addDoc(collection(db, ...base, 'targets'), targetData);
+    const newId = docRef.id;
+    if (!isUndoRedo) {
+      pushAction({
+        description: `Added target "${cleanName}"`,
+        undo: async () => deleteDoc(doc(db, ...base, 'targets', newId)),
+        redo: async () => setDoc(doc(db, ...base, 'targets', newId), targetData),
+      });
+    }
+    return docRef;
   };
 
-  const pinTargetVoice = async (query) => {
+  const pinTargetVoice = async (query, isUndoRedo = false) => {
+    if (!query) return;
     const qLower = query.toLowerCase().trim();
     const matched = targets.find((t) => t.name.toLowerCase().includes(qLower));
     if (matched) {
-      targets.forEach((t) => updateDoc(doc(db, ...base, 'targets', t.id), { pinned: t.id === matched.id }));
+      const prevPinned = matched.pinned;
+      const prevPinnedTargetIds = targets.filter((t) => t.pinned).map((t) => t.id);
+      targets.forEach((t) => updateDoc(doc(db, ...base, 'targets', t.id), { pinned: t.id === matched.id ? !prevPinned : false }));
+      if (!isUndoRedo) {
+        pushAction({
+          description: prevPinned ? `Unpinned target "${matched.name}"` : `Pinned target "${matched.name}"`,
+          undo: async () => {
+            targets.forEach((t) => updateDoc(doc(db, ...base, 'targets', t.id), { pinned: prevPinnedTargetIds.includes(t.id) }));
+          },
+          redo: async () => {
+            targets.forEach((t) => updateDoc(doc(db, ...base, 'targets', t.id), { pinned: t.id === matched.id ? !prevPinned : false }));
+          },
+        });
+      }
     }
   };
 
-  const deleteTargetVoice = async (query) => {
+  const deleteTargetVoice = async (query, isUndoRedo = false) => {
+    if (!query) return;
     const qLower = query.toLowerCase().trim();
     const matched = targets.find((t) => t.name.toLowerCase().includes(qLower));
     if (matched) {
-      await deleteDoc(doc(db, ...base, 'targets', matched.id));
+      const { id, ...data } = matched;
+      await deleteDoc(doc(db, ...base, 'targets', id));
+      if (!isUndoRedo) {
+        pushAction({
+          description: `Deleted target "${matched.name}"`,
+          undo: async () => setDoc(doc(db, ...base, 'targets', id), data),
+          redo: async () => deleteDoc(doc(db, ...base, 'targets', id)),
+        });
+      }
     }
   };
 
-  const addEventVoice = async (title, evDate, time, type) => {
+  const addEventVoice = async (title, evDate, time = '', type = 'test', isUndoRedo = false) => {
     if (!title?.trim()) return;
-    await addDoc(collection(db, ...base, 'events'), {
-      title: title.trim(),
-      date: evDate || date,
-      time: time || '',
-      type: type || 'test',
-    });
+    const cleanTitle = title.trim();
+    const eventData = { title: cleanTitle, date: evDate || date, time: time || '', type: type || 'test', note: '', createdAt: Date.now() };
+    const docRef = await addDoc(collection(db, ...base, 'events'), eventData);
+    const newId = docRef.id;
+    if (!isUndoRedo) {
+      pushAction({
+        description: `Added event "${cleanTitle}"`,
+        undo: async () => deleteDoc(doc(db, ...base, 'events', newId)),
+        redo: async () => setDoc(doc(db, ...base, 'events', newId), eventData),
+      });
+    }
+    return docRef;
   };
 
-  const deleteEventVoice = async (query) => {
+  const deleteEventVoice = async (query, isUndoRedo = false) => {
+    if (!query) return;
     const qLower = query.toLowerCase().trim();
     const matched = events.find((e) => e.title.toLowerCase().includes(qLower));
     if (matched) {
-      await deleteDoc(doc(db, ...base, 'events', matched.id));
+      const { id, ...data } = matched;
+      await deleteDoc(doc(db, ...base, 'events', id));
+      if (!isUndoRedo) {
+        pushAction({
+          description: `Deleted event "${matched.title}"`,
+          undo: async () => setDoc(doc(db, ...base, 'events', id), data),
+          redo: async () => deleteDoc(doc(db, ...base, 'events', id)),
+        });
+      }
     }
   };
 
   const deleteLabelVoice = async (name) => {
-    const qLower = name.toLowerCase().trim();
-    const matched = labels.find((l) => l.name.toLowerCase().includes(qLower));
+    if (!name) return;
+    const matched = labels.find((l) => l.name.toLowerCase() === name.toLowerCase());
     if (matched) {
       await delLabel(matched.id, matched.name);
     }
   };
 
-  const updateSettingsVoice = (patch) => {
+  const updateSettingsVoice = (patch, isUndoRedo = false) => {
+    const prevSettings = { ...s };
+    let newPatch = { ...patch };
     if (patch.collapsed === '__toggle__') {
-      save({ collapsed: !s.collapsed });
-    } else {
-      save(patch);
+      newPatch.collapsed = !s.collapsed;
+    }
+    save(newPatch);
+    if (!isUndoRedo) {
+      const desc = patch.wall ? `Changed wallpaper to ${patch.wall}` :
+                   patch.layout ? `Changed layout to ${patch.layout}` :
+                   patch.accent ? `Changed accent color` :
+                   patch.collapsed !== undefined ? `Toggled sidebar` : `Updated settings`;
+      pushAction({
+        description: desc,
+        undo: async () => save(prevSettings),
+        redo: async () => save(newPatch),
+      });
     }
   };
+
+  const undoRedoControls = (
+    <div className="undo-redo-group" title="Undo (Ctrl+Z) / Redo (Ctrl+Y)">
+      <button
+        type="button"
+        className="undo-redo-btn"
+        disabled={!undoStack.length}
+        onClick={handleUndo}
+        title={undoStack.length ? `Undo: ${undoStack[undoStack.length - 1]?.description || 'last action'} (Ctrl+Z)` : 'Nothing to undo (Ctrl+Z)'}
+      >
+        <i className="ti ti-arrow-back-up" />
+        <span>Undo</span>
+      </button>
+      <button
+        type="button"
+        className="undo-redo-btn"
+        disabled={!redoStack.length}
+        onClick={handleRedo}
+        title={redoStack.length ? `Redo: ${redoStack[redoStack.length - 1]?.description || 'next action'} (Ctrl+Y)` : 'Nothing to redo (Ctrl+Y)'}
+      >
+        <i className="ti ti-arrow-forward-up" />
+        <span>Redo</span>
+      </button>
+    </div>
+  );
 
   const day = tasks.filter((t) => t.date === date).sort((a, b) => a.createdAt - b.createdAt);
   const checks = day.filter((t) => t.type === 'task');
@@ -419,7 +700,38 @@ function Main({ user }) {
   return (
     <div className={'app' + (s.collapsed ? ' mini' : '')}>
       <aside>
-        <div className="brand"><b className="lbl">Planner</b><button title="Toggle icon-only sidebar" onClick={() => save({ collapsed: !s.collapsed })}><i className={'ti ' + (s.collapsed ? 'ti-layout-sidebar-left-expand' : 'ti-layout-sidebar-left-collapse')} /></button></div>
+        <div className="brand">
+          <b className="lbl">Planner</b>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {!s.collapsed && (
+              <div className="undo-redo-group" title="Undo (Ctrl+Z) / Redo (Ctrl+Y)">
+                <button
+                  type="button"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11 }}
+                  disabled={!undoStack.length}
+                  onClick={handleUndo}
+                  title={undoStack.length ? `Undo: ${undoStack[undoStack.length - 1]?.description || 'last action'} (Ctrl+Z)` : 'Nothing to undo (Ctrl+Z)'}
+                >
+                  <i className="ti ti-arrow-back-up" />
+                </button>
+                <button
+                  type="button"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11 }}
+                  disabled={!redoStack.length}
+                  onClick={handleRedo}
+                  title={redoStack.length ? `Redo: ${redoStack[redoStack.length - 1]?.description || 'next action'} (Ctrl+Y)` : 'Nothing to redo (Ctrl+Y)'}
+                >
+                  <i className="ti ti-arrow-forward-up" />
+                </button>
+              </div>
+            )}
+            <button title="Toggle icon-only sidebar" onClick={() => save({ collapsed: !s.collapsed })}>
+              <i className={'ti ' + (s.collapsed ? 'ti-layout-sidebar-left-expand' : 'ti-layout-sidebar-left-collapse')} />
+            </button>
+          </div>
+        </div>
         {s.layout === 'columns' && cd}
         {nav('day', 'ti-list-check', 'Day view')}
         {nav('calendar', 'ti-calendar', 'Calendar')}
@@ -472,29 +784,32 @@ function Main({ user }) {
       </aside>
 
       <main>
-        {view === 'calendar' && <Calendar tasks={tasks} events={events} edit={setEvm} open={(d) => { setDate(d); setView('day'); }} />}
+        {view === 'calendar' && <Calendar tasks={tasks} events={events} edit={setEvm} open={(d) => { setDate(d); setView('day'); }} undoRedoGroup={undoRedoControls} />}
         {view === 'analysis' && <Analysis tasks={tasks} labels={labels} upd={upd} del={del} />}
-        {view === 'targets' && <Targets targets={targets} base={base} />}
+        {view === 'targets' && <Targets targets={targets} base={base} onAdd={addTargetVoice} onPin={pinTargetVoice} onDelete={deleteTargetVoice} undoRedoGroup={undoRedoControls} />}
         {lid && (
           <div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
               <h2>{currentLabelObj?.name || 'Label'}</h2>
-              <button
-                type="button"
-                className="pill"
-                style={{
-                  background: '#ef44441c',
-                  color: '#f87171',
-                  border: '1px solid #ef444438',
-                  fontSize: 12,
-                  padding: '6px 14px',
-                }}
-                onClick={() => {
-                  if (currentLabelObj) delLabel(currentLabelObj.id, currentLabelObj.name);
-                }}
-              >
-                <i className="ti ti-trash" /> Remove Label
-              </button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {undoRedoControls}
+                <button
+                  type="button"
+                  className="pill"
+                  style={{
+                    background: '#ef44441c',
+                    color: '#f87171',
+                    border: '1px solid #ef444438',
+                    fontSize: 12,
+                    padding: '6px 14px',
+                  }}
+                  onClick={() => {
+                    if (currentLabelObj) delLabel(currentLabelObj.id, currentLabelObj.name);
+                  }}
+                >
+                  <i className="ti ti-trash" /> Remove Label
+                </button>
+              </div>
             </div>
             {!lt.length && <p className="muted">Nothing here yet. Add this label to a task from the Day view or by voice.</p>}
             {[...new Set(lt.map((t) => t.date))].sort().reverse().map((d) => (
@@ -514,7 +829,10 @@ function Main({ user }) {
                 <button title="Next day" onClick={() => shift(1)}><i className="ti ti-chevron-right" /></button>
                 <button onClick={() => setDate(iso(new Date()))}>Today</button>
               </div>
-              {s.showPercent && s.layout === 'columns' && <Progress pct={pct} done={nDone} total={checks.length} />}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                {undoRedoControls}
+                {s.showPercent && s.layout === 'columns' && <Progress pct={pct} done={nDone} total={checks.length} />}
+              </div>
             </header>
 
             <div className="evbar">
@@ -543,6 +861,10 @@ function Main({ user }) {
         targets={targets}
         events={events}
         settings={s}
+        canUndo={undoStack.length > 0}
+        canRedo={redoStack.length > 0}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
         onNavigateView={(targetView) => setView(targetView)}
         onDateChange={(targetDate) => setDate(targetDate)}
         onAddTask={(sec, txt, typ, d, lbl) => add(sec, txt, typ, d, lbl)}
@@ -559,6 +881,13 @@ function Main({ user }) {
         onToggleSettingsModal={(isOpen) => setOpen(isOpen)}
         onSignOut={() => signOut(auth)}
       />
+
+      {/* Floating Undo/Redo Action Notification Toast */}
+      {undoToast && (
+        <div className="undo-toast">
+          <span>{undoToast}</span>
+        </div>
+      )}
 
       {evm && <EventModal ev={evm} base={base} onClose={() => setEvm(null)} />}
       {open && (
@@ -584,7 +913,7 @@ function Main({ user }) {
   );
 }
 
-function Calendar({ tasks, events, open, edit }) {
+function Calendar({ tasks, events, open, edit, undoRedoGroup }) {
   const [m, setM] = useState(() => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), 1); });
   const first = (m.getDay() + 6) % 7;
   const days = new Date(m.getFullYear(), m.getMonth() + 1, 0).getDate();
@@ -599,7 +928,10 @@ function Calendar({ tasks, events, open, edit }) {
           <h2>{m.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}</h2>
           <button title="Next month" onClick={() => go(1)}><i className="ti ti-chevron-right" /></button>
         </div>
-        <button className="pill" onClick={() => edit({ date: today })}><i className="ti ti-plus" /> Event</button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {undoRedoGroup}
+          <button className="pill" onClick={() => edit({ date: today })}><i className="ti ti-plus" /> Event</button>
+        </div>
       </header>
       <div className="cal">
         {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d) => <div className="muted" key={d}>{d}</div>)}
