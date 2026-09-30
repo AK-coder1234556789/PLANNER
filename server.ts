@@ -592,7 +592,7 @@ app.post('/api/transcribe-audio', async (req, res) => {
     const ai = getAiClient();
     const audioPart = {
       inlineData: {
-        mimeType: mimeType || 'audio/webm',
+        mimeType: mimeType || 'audio/wav',
         data: audioBase64,
       },
     };
@@ -606,11 +606,11 @@ app.post('/api/transcribe-audio', async (req, res) => {
           model,
           contents: [
             audioPart,
-            'Transcribe this voice command from a student planner verbatim. Return ONLY the plain words with no quotes or commentary.',
+            'Transcribe all spoken words from this audio clip verbatim. If the audio is silence or background noise with no discernable words, return empty string. Return ONLY the transcribed text.',
           ],
         });
         const text = transRes.text?.trim().replace(/^["']|["']$/g, '') || '';
-        if (text) {
+        if (text && !text.toUpperCase().includes('NO_SPEECH') && !text.toUpperCase().includes('SILENCE')) {
           transcribed = text;
           break;
         }
@@ -631,10 +631,6 @@ app.post('/api/parse-voice-command', async (req, res) => {
   try {
     const { speechText, audioBase64, mimeType, currentDate, existingLabels, currentView } = req.body;
 
-    if (!speechText && !audioBase64) {
-      return res.status(400).json({ error: 'Either speechText or audioBase64 is required' });
-    }
-
     const today = currentDate || new Date().toISOString().slice(0, 10);
     const dayOfWeek = new Date(today + 'T00:00').toLocaleDateString('en-US', { weekday: 'long' });
 
@@ -647,7 +643,7 @@ app.post('/api/parse-voice-command', async (req, res) => {
         const ai = getAiClient();
         const audioPart = {
           inlineData: {
-            mimeType: mimeType || 'audio/webm',
+            mimeType: mimeType || 'audio/wav',
             data: audioBase64,
           },
         };
@@ -659,11 +655,11 @@ app.post('/api/parse-voice-command', async (req, res) => {
               model: m,
               contents: [
                 audioPart,
-                'Generate a verbatim transcript of this student speech command for a study planner. Output only the plain transcribed words.',
+                'Transcribe all words spoken by the student in this audio clip verbatim. Output only the plain transcribed words.',
               ],
             });
             const textOut = transRes.text?.trim() || '';
-            if (textOut) {
+            if (textOut && !textOut.toUpperCase().includes('NO_SPEECH') && !textOut.toUpperCase().includes('SILENCE')) {
               recognizedText = textOut.replace(/^["']|["']$/g, '').trim();
               console.log(`[AI Server] Audio transcribed successfully by ${m}: "${recognizedText}"`);
               break;
@@ -675,6 +671,19 @@ app.post('/api/parse-voice-command', async (req, res) => {
       } catch (err: any) {
         console.warn('[AI Server] Audio transcription setup failed:', err?.message || err);
       }
+    }
+
+    // If no text could be recognized at all, gracefully inform the student instead of crashing
+    if (!recognizedText && !speechText) {
+      return res.json({
+        success: true,
+        data: {
+          action: 'feedback_only',
+          feedback: "Could not hear clear speech from your mic. Please speak a little louder or pick a quick command below.",
+          transcription: '',
+          payload: {},
+        },
+      });
     }
 
     const systemInstruction = `You are an expert AI voice assistant for a JEE (Joint Entrance Examination) student study planner web application.
@@ -831,11 +840,25 @@ Always provide a concise, friendly confirmation in "feedback" (e.g. "Switched to
       return res.json({ success: true, data: fallbackResult });
     }
 
-    throw lastError || new Error('Failed to analyze voice command with AI');
+    return res.json({
+      success: true,
+      data: {
+        action: 'feedback_only',
+        feedback: "Could not understand command clearly. Please try speaking again or select a quick command below.",
+        transcription: textForFallback || '',
+        payload: {},
+      },
+    });
   } catch (error: any) {
     console.error('Error in /api/parse-voice-command:', error);
-    return res.status(500).json({
-      error: error.message || 'Failed to analyze voice command with AI',
+    return res.json({
+      success: true,
+      data: {
+        action: 'feedback_only',
+        feedback: "Could not process audio. Please speak again or select a quick command below.",
+        transcription: '',
+        payload: {},
+      },
     });
   }
 });

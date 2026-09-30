@@ -233,4 +233,11 @@ details{margin-top:10px;color:var(--muted)}
 .ai-blinking-cursor{display:inline-block;color:#4ade80;font-weight:bold;margin-left:2px;animation:blink 0.8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 
+/* Quick voice action chips in the tray */
+.ai-quick-command-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding-top:2px}
+.ai-quick-label{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:600;margin-right:2px}
+.ai-quick-chip{background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:999px;padding:3px 8px;font-size:11px;cursor:pointer;transition:all 0.15s ease}
+.ai-quick-chip:hover{background:var(--accent);color:#fff;border-color:var(--accent);transform:translateY(-1px)}
+
+
 

@@ -191,6 +191,53 @@ function clientParseVoiceCommand(speechText, currentDate, labels = []) {
   };
 }
 
+// Downsample audio Float32 buffer and produce standard 16kHz Mono 16-bit PCM WAV
+function createWavBlobFromSamples(floatSamples, inputSampleRate = 44100, targetSampleRate = 16000) {
+  if (!floatSamples || floatSamples.length === 0) return null;
+  const ratio = inputSampleRate / targetSampleRate;
+  const newLength = Math.max(1, Math.round(floatSamples.length / ratio));
+  const downsampled = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetInput = 0;
+  while (offsetResult < downsampled.length) {
+    const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetInput; i < nextOffsetInput && i < floatSamples.length; i++) {
+      accum += floatSamples[i];
+      count++;
+    }
+    downsampled[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetInput = nextOffsetInput;
+  }
+
+  const buffer = new ArrayBuffer(44 + downsampled.length * 2);
+  const view = new DataView(buffer);
+  // RIFF
+  view.setUint8(0, 0x52); view.setUint8(1, 0x49); view.setUint8(2, 0x46); view.setUint8(3, 0x46);
+  view.setUint32(4, 36 + downsampled.length * 2, true);
+  view.setUint8(8, 0x57); view.setUint8(9, 0x41); view.setUint8(10, 0x56); view.setUint8(11, 0x45);
+  // fmt
+  view.setUint8(12, 0x66); view.setUint8(13, 0x6d); view.setUint8(14, 0x74); view.setUint8(15, 0x20);
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, targetSampleRate, true);
+  view.setUint32(28, targetSampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  // data
+  view.setUint8(36, 0x64); view.setUint8(37, 0x61); view.setUint8(38, 0x74); view.setUint8(39, 0x61);
+  view.setUint32(40, downsampled.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < downsampled.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, downsampled[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([view], { type: 'audio/wav' });
+}
+
 export default function AiVoiceMic({
   currentDate,
   currentView,
@@ -253,6 +300,13 @@ export default function AiVoiceMic({
   const audioChunksRef = useRef([]);
   const feedbackTimerRef = useRef(null);
 
+  // Raw PCM sample accumulator from Web Audio API (captures direct headset audio)
+  const recordedSamplesRef = useRef([]);
+  const scriptProcessorRef = useRef(null);
+  const isListeningRef = useRef(false);
+  const isTranscribingRef = useRef(false);
+  const liveTranscribeTimerRef = useRef(null);
+
   // Load and enumerate all available microphone devices
   const loadAudioDevices = async () => {
     try {
@@ -293,7 +347,6 @@ export default function AiVoiceMic({
           },
     };
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    // Reload devices now that permission is active to reveal device labels
     loadAudioDevices();
     return stream;
   };
@@ -303,7 +356,6 @@ export default function AiVoiceMic({
     setSelectedDeviceId(newDeviceId);
     localStorage.setItem('jee_selected_mic_id', newDeviceId);
 
-    // If currently testing or recording, immediately switch audio stream to new mic
     if (isTestingMic || listening) {
       try {
         const stream = await getAudioStream(newDeviceId);
@@ -314,7 +366,58 @@ export default function AiVoiceMic({
     }
   };
 
-  // Real-time audio analyzer using Web Audio API
+  // Active live headset audio transcriber (sends captured audio snippets to Gemini for live text display)
+  const triggerLiveTranscribe = () => {
+    if (liveTranscribeTimerRef.current) return;
+    liveTranscribeTimerRef.current = setTimeout(async () => {
+      liveTranscribeTimerRef.current = null;
+      if (isTranscribingRef.current || recordedSamplesRef.current.length < 8) return;
+      isTranscribingRef.current = true;
+      try {
+        let totalLength = 0;
+        for (const arr of recordedSamplesRef.current) totalLength += arr.length;
+        const merged = new Float32Array(totalLength);
+        let offset = 0;
+        for (const arr of recordedSamplesRef.current) {
+          merged.set(arr, offset);
+          offset += arr.length;
+        }
+
+        const audioCtx = audioContextRef.current;
+        const wavBlob = createWavBlobFromSamples(merged, audioCtx?.sampleRate || 44100, 16000);
+        if (!wavBlob || wavBlob.size < 1200) return;
+
+        const reader = new FileReader();
+        const base64Promise = new Promise((resolve) => {
+          reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
+        });
+        reader.readAsDataURL(wavBlob);
+        const b64 = await base64Promise;
+        if (!b64) return;
+
+        const res = await fetch('/api/transcribe-audio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audioBase64: b64, mimeType: 'audio/wav' }),
+        });
+
+        if (res.ok) {
+          const resData = await res.json();
+          if (resData.success && resData.transcript) {
+            console.log('[Live Transcribe] Actively written text:', resData.transcript);
+            setTranscript(resData.transcript);
+            setManualCmd(resData.transcript);
+          }
+        }
+      } catch (err) {
+        console.warn('Live transcribe check notice:', err);
+      } finally {
+        isTranscribingRef.current = false;
+      }
+    }, 1100);
+  };
+
+  // Real-time audio analyzer using Web Audio API + PCM sample capture
   const startAudioVisualizer = (stream) => {
     try {
       stopAudioVisualizer();
@@ -334,6 +437,25 @@ export default function AiVoiceMic({
 
       const source = audioCtx.createMediaStreamSource(stream);
       source.connect(analyser);
+
+      // ScriptProcessorNode to capture raw Float32 audio samples from the headset
+      try {
+        const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+        scriptProcessorRef.current = scriptNode;
+        scriptNode.onaudioprocess = (e) => {
+          if (!isListeningRef.current) return;
+          const input = e.inputBuffer.getChannelData(0);
+          recordedSamplesRef.current.push(new Float32Array(input));
+          // If vocal audio is being received, trigger live active transcription
+          if (silenceCounterRef.current < 20) {
+            triggerLiveTranscribe();
+          }
+        };
+        source.connect(scriptNode);
+        scriptNode.connect(audioCtx.destination);
+      } catch (scriptErr) {
+        console.warn('ScriptProcessor setup note:', scriptErr);
+      }
 
       const bufferLength = analyser.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
@@ -387,6 +509,12 @@ export default function AiVoiceMic({
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
     }
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect();
+      } catch {}
+      scriptProcessorRef.current = null;
+    }
     if (audioContextRef.current) {
       try {
         audioContextRef.current.close();
@@ -402,54 +530,13 @@ export default function AiVoiceMic({
     setFrequencies([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
   };
 
-  const isTranscribingRef = useRef(false);
-  const liveTranscribeTimerRef = useRef(null);
-
-  // Active live headset audio transcriber (sends captured audio snippets to Gemini for live text display)
-  const triggerLiveTranscribe = () => {
-    if (liveTranscribeTimerRef.current) clearTimeout(liveTranscribeTimerRef.current);
-    liveTranscribeTimerRef.current = setTimeout(async () => {
-      if (isTranscribingRef.current || audioChunksRef.current.length === 0) return;
-      isTranscribingRef.current = true;
-      try {
-        const mime = mediaRecorderRef.current?.mimeType || 'audio/webm';
-        const audioBlob = new Blob(audioChunksRef.current, { type: mime });
-        if (audioBlob.size < 500) return; // Too small to contain speech
-
-        const reader = new FileReader();
-        const base64Promise = new Promise((resolve) => {
-          reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
-        });
-        reader.readAsDataURL(audioBlob);
-        const b64 = await base64Promise;
-        if (!b64) return;
-
-        const res = await fetch('/api/transcribe-audio', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ audioBase64: b64, mimeType: mime }),
-        });
-
-        if (res.ok) {
-          const resData = await res.json();
-          if (resData.success && resData.transcript) {
-            setTranscript(resData.transcript);
-            setManualCmd(resData.transcript);
-          }
-        }
-      } catch (err) {
-        console.warn('Live transcribe check failed:', err);
-      } finally {
-        isTranscribingRef.current = false;
-      }
-    }, 650);
-  };
-
   // Direct Audio Recorder using browser microphone
   const startMediaRecorder = async () => {
     try {
       const stream = await getAudioStream();
+      recordedSamplesRef.current = [];
       audioChunksRef.current = [];
+      isListeningRef.current = true;
       startAudioVisualizer(stream);
 
       // Pick best supported MIME type
@@ -462,28 +549,19 @@ export default function AiVoiceMic({
         }
       }
 
-      const mediaRecorder = new MediaRecorder(stream, { mimeType });
-      mediaRecorderRef.current = mediaRecorder;
+      try {
+        const mediaRecorder = new MediaRecorder(stream, { mimeType });
+        mediaRecorderRef.current = mediaRecorder;
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+        mediaRecorder.start(800);
+      } catch (mrErr) {
+        console.warn('MediaRecorder init note:', mrErr);
+      }
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-          // When sound has been received, trigger live transcription
-          triggerLiveTranscribe();
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-        stopAudioVisualizer();
-        setListening(false);
-        if (audioChunksRef.current.length > 0) {
-          executeVoiceCommand(manualCmd || transcript || '', audioBlob);
-        }
-      };
-
-      // Collect data in 800ms timeslices so live transcription can stream actively
-      mediaRecorder.start(800);
       setListening(true);
       setError('');
       setUseDirectAudio(true);
@@ -506,8 +584,11 @@ export default function AiVoiceMic({
     try {
       setError('');
       if (listening) {
+        isListeningRef.current = false;
         if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop();
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          try { mediaRecorderRef.current.stop(); } catch {}
+        }
         setListening(false);
       }
       const stream = await getAudioStream();
@@ -526,7 +607,7 @@ export default function AiVoiceMic({
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = 'en-IN'; // Indian English / general English fits JEE terminology
+      recognition.lang = navigator.language || 'en-US';
 
       recognition.onstart = () => {
         setError('');
@@ -540,7 +621,7 @@ export default function AiVoiceMic({
         const text = full.trim();
         if (text) {
           setTranscript(text);
-          setManualCmd(text); // ACTIVELY write into the command input in real-time as spoken!
+          setManualCmd(text);
         }
       };
 
@@ -552,7 +633,12 @@ export default function AiVoiceMic({
       };
 
       recognition.onend = () => {
-        // Kept alive by mediaRecorder
+        // Auto-restart if user is still listening
+        if (isListeningRef.current && recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+          } catch {}
+        }
       };
 
       recognitionRef.current = recognition;
@@ -594,7 +680,7 @@ export default function AiVoiceMic({
         });
         reader.readAsDataURL(audioBlob);
         payload.audioBase64 = await base64Promise;
-        payload.mimeType = audioBlob.type || 'audio/webm';
+        payload.mimeType = audioBlob.type || 'audio/wav';
       } else {
         payload.speechText = textToProcess;
       }
@@ -627,8 +713,11 @@ export default function AiVoiceMic({
         commandData = clientParseVoiceCommand(textToProcess, currentDate, labels);
       }
 
-      if (!commandData) {
-        throw new Error('Could not recognize voice command. Please speak again or type your command below.');
+      if (!commandData || commandData.action === 'feedback_only') {
+        const msg = commandData?.feedback || "Could not hear clear speech. Try speaking closer to mic or pick a quick command below.";
+        setFeedback({ message: msg });
+        speakFeedback(msg);
+        return;
       }
 
       const { action, feedback: actionFeedback, payload: p } = commandData;
@@ -792,18 +881,34 @@ export default function AiVoiceMic({
   };
 
   // Process stopping recording and submitting command
-  const handleDoneAndRun = () => {
+  const handleDoneAndRun = (overrideText = '') => {
+    isListeningRef.current = false;
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch {}
     }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.stop();
-    } else {
-      stopAudioVisualizer();
-      setListening(false);
-      const cmd = (transcript || manualCmd).trim();
-      if (cmd) executeVoiceCommand(cmd);
+      try { mediaRecorderRef.current.stop(); } catch {}
     }
+
+    // Merge Float32 samples from headset into pristine 16kHz Mono WAV
+    let finalWavBlob = null;
+    if (recordedSamplesRef.current && recordedSamplesRef.current.length > 0) {
+      let totalLength = 0;
+      for (const arr of recordedSamplesRef.current) totalLength += arr.length;
+      const merged = new Float32Array(totalLength);
+      let offset = 0;
+      for (const arr of recordedSamplesRef.current) {
+        merged.set(arr, offset);
+        offset += arr.length;
+      }
+      const audioCtx = audioContextRef.current;
+      finalWavBlob = createWavBlobFromSamples(merged, audioCtx?.sampleRate || 44100, 16000);
+    }
+
+    stopAudioVisualizer();
+    setListening(false);
+    const cmd = (overrideText || transcript || manualCmd).trim();
+    executeVoiceCommand(cmd, finalWavBlob);
   };
 
   // Toggle microphone recording
@@ -989,6 +1094,66 @@ export default function AiVoiceMic({
               title="Test microphone input level"
             >
               <i className="ti ti-tool" style={{ marginRight: 3 }} /> Test Mic
+            </button>
+          </div>
+
+          {/* Quick Tap Command Suggestions */}
+          <div className="ai-quick-command-row">
+            <span className="ai-quick-label">Tap to run:</span>
+            <button
+              type="button"
+              className="ai-quick-chip"
+              onClick={() => {
+                setTranscript('Go to Calendar');
+                setManualCmd('Go to Calendar');
+                handleDoneAndRun('Go to Calendar');
+              }}
+            >
+              📅 Calendar
+            </button>
+            <button
+              type="button"
+              className="ai-quick-chip"
+              onClick={() => {
+                setTranscript('Add Optics to Lectures');
+                setManualCmd('Add Optics to Lectures');
+                handleDoneAndRun('Add Optics to Lectures');
+              }}
+            >
+              📚 Add Optics
+            </button>
+            <button
+              type="button"
+              className="ai-quick-chip"
+              onClick={() => {
+                setTranscript('Mark optics done');
+                setManualCmd('Mark optics done');
+                handleDoneAndRun('Mark optics done');
+              }}
+            >
+              ✅ Mark Done
+            </button>
+            <button
+              type="button"
+              className="ai-quick-chip"
+              onClick={() => {
+                setTranscript('Wallpaper dusk');
+                setManualCmd('Wallpaper dusk');
+                handleDoneAndRun('Wallpaper dusk');
+              }}
+            >
+              🎨 Dusk
+            </button>
+            <button
+              type="button"
+              className="ai-quick-chip"
+              onClick={() => {
+                setTranscript('View Targets');
+                setManualCmd('View Targets');
+                handleDoneAndRun('View Targets');
+              }}
+            >
+              🎯 Targets
             </button>
           </div>
 
