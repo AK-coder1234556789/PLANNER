@@ -18,8 +18,8 @@ import {
   onSnapshot,
   arrayUnion,
   arrayRemove,
-  signInGuest,
 } from './firebase';
+import AiVoiceMic from './AiVoiceMic';
 
 const SECTIONS = [['lectures', 'Lectures'], ['hw', 'HW'], ['doubts', 'Doubts']];
 const EV = { test: ['Test', '#ef4444'], revision: ['Revision', '#3b82f6'], deadline: ['Deadline', '#f59e0b'], other: ['Other', '#a78bfa'] };
@@ -27,11 +27,18 @@ const DEF = { layout: 'columns', collapsed: false, accent: '#f97316', showPercen
 const iso = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
 const left = (date) => Math.round((new Date(date + 'T00:00') - new Date(iso(new Date()) + 'T00:00')) / 864e5);
 
-const friendly = (e) => ({
-  'auth/unauthorized-domain': 'This domain is not authorized in Firebase. Add it under Authentication > Settings > Authorized domains.',
-  'auth/operation-not-allowed': 'Google sign-in is not enabled. Turn it on under Authentication > Sign-in method.',
-  'auth/network-request-failed': 'No internet connection. Try again when you are online.',
-}[e.code] || e.message);
+const friendly = (e) => {
+  if (!e) return 'An unexpected error occurred.';
+  const code = e.code || '';
+  const map = {
+    'auth/unauthorized-domain': 'This domain is not authorized in Firebase. Add it under Authentication > Settings > Authorized domains.',
+    'auth/operation-not-allowed': 'Google sign-in is not enabled. Turn it on under Authentication > Sign-in method.',
+    'auth/network-request-failed': 'No internet connection. Try again when you are online.',
+    'auth/popup-blocked': 'Sign-in popup was blocked by browser. Please allow popups.',
+    'auth/popup-closed-by-user': 'Sign-in was cancelled.',
+  };
+  return map[code] || e.message || String(e);
+};
 
 const GLogo = (
   <svg width="18" height="18" viewBox="0 0 48 48">
@@ -46,45 +53,102 @@ export default function App() {
   const [user, setUser] = useState(undefined);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+
   useEffect(() => {
-    getRedirectResult(auth).catch((e) => setErr(friendly(e)));
-    return onAuthStateChanged(auth, setUser);
+    let unmounted = false;
+
+    // Safety timeout: Never stay stuck on "Connecting Firebase..." forever
+    const timer = setTimeout(() => {
+      if (!unmounted) {
+        setUser((curr) => (curr === undefined ? null : curr));
+      }
+    }, 2500);
+
+    getRedirectResult(auth)
+      .then((res) => {
+        if (res?.user && !unmounted) {
+          setUser(res.user);
+        }
+      })
+      .catch((e) => {
+        console.warn('Redirect check notice:', e);
+        if (!unmounted && e?.code !== 'auth/popup-closed-by-user') {
+          setErr(friendly(e));
+        }
+      });
+
+    const unsubscribe = onAuthStateChanged(
+      auth,
+      (u) => {
+        if (!unmounted) {
+          setUser(u ?? null);
+        }
+      },
+      (error) => {
+        console.warn('onAuthStateChanged notice:', error);
+        if (!unmounted) {
+          setErr(friendly(error));
+          setUser(null);
+        }
+      }
+    );
+
+    return () => {
+      unmounted = true;
+      clearTimeout(timer);
+      unsubscribe();
+    };
   }, []);
+
   const login = async () => {
-    setErr(''); setBusy(true);
-    try { await signInWithPopup(auth, provider); }
-    catch (e) {
-      if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment') { signInWithRedirect(auth, provider); return; }
-      if (e.code !== 'auth/popup-closed-by-user' && e.code !== 'auth/cancelled-popup-request') setErr(friendly(e));
+    setErr('');
+    setBusy(true);
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (e) {
+      console.warn('Sign-in error:', e);
+      if (e?.code === 'auth/popup-blocked' || e?.code === 'auth/operation-not-supported-in-this-environment') {
+        try {
+          await signInWithRedirect(auth, provider);
+          return;
+        } catch (redirectErr) {
+          setErr(friendly(redirectErr));
+        }
+      } else if (e?.code !== 'auth/popup-closed-by-user' && e?.code !== 'auth/cancelled-popup-request') {
+        setErr(friendly(e));
+      }
       setBusy(false);
     }
   };
-  const loginGuest = () => {
-    signInGuest();
-  };
 
-  if (user === undefined) return <div className="center muted">Loading…</div>;
-  if (!user) return (
-    <div className="center">
-      <div className="card login">
-        <div className="logo"><i className="ti ti-target" /></div>
-        <h2>Plan every day.<br />Finish the syllabus.</h2>
-        <p className="muted">Your tasks, notes and calendar sync in real time between your phone and laptop.</p>
-        {configured ? (
-          <>
-            <button className="gbtn" onClick={login} disabled={busy}>{GLogo}{busy ? 'Signing in…' : 'Continue with Google'}</button>
-            <button className="pill" style={{ width: '100%', background: '#ffffff12', color: 'var(--text)' }} onClick={loginGuest}>Explore in Guest Mode</button>
-          </>
-        ) : (
-          <>
-            <button className="gbtn" onClick={loginGuest}><i className="ti ti-user" /> Continue as Guest</button>
-            <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>Firebase credentials not detected in .env. Running with local offline persistence.</p>
-          </>
-        )}
-        {err && <p className="err">{err}</p>}
+  if (user === undefined) {
+    return (
+      <div className="center muted">
+        <div style={{ display: 'grid', gap: 10, placeItems: 'center' }}>
+          <div className="ai-dot-pulse" style={{ background: 'var(--accent)', width: 12, height: 12 }} />
+          <span>Connecting Firebase…</span>
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="center">
+        <div className="card login">
+          <div className="logo"><i className="ti ti-target" /></div>
+          <h2>Plan every day.<br />Finish the syllabus.</h2>
+          <p className="muted">Your tasks, notes and calendar sync in real time with Google & Firebase.</p>
+          <button className="gbtn" onClick={login} disabled={busy}>
+            {GLogo}{busy ? 'Signing in with Google…' : 'Sign in with Google'}
+          </button>
+          <p className="muted" style={{ fontSize: 11, marginTop: 4 }}>Secured with Firebase Google Authentication</p>
+          {err && <p className="err">{err}</p>}
+        </div>
+      </div>
+    );
+  }
+
   return <Main user={user} />;
 }
 
@@ -206,10 +270,135 @@ function Main({ user }) {
 
   const save = (p) => { const n = { ...s, ...p }; setS(n); setDoc(doc(db, ...base, 'settings', 'profile'), n); };
   const saveCd = (p) => save({ cd: { ...s.cd, ...p } });
-  const add = (section, text, type) => text.trim() && addDoc(collection(db, ...base, 'tasks'), { text: text.trim(), type, section, date, done: false, labelIds: [], createdAt: Date.now() });
+  const add = (section, text, type, taskDate = date, labelName = null) => {
+    if (!text?.trim()) return;
+    let labelIds = [];
+    if (labelName) {
+      const match = labels.find((l) => l.name.toLowerCase() === labelName.toLowerCase());
+      if (match) labelIds = [match.id];
+    }
+    return addDoc(collection(db, ...base, 'tasks'), {
+      text: text.trim(),
+      type: type || 'task',
+      section: section || 'lectures',
+      date: taskDate || date,
+      done: false,
+      labelIds,
+      createdAt: Date.now(),
+    });
+  };
   const upd = (id, p) => updateDoc(doc(db, ...base, 'tasks', id), p);
   const del = (id) => deleteDoc(doc(db, ...base, 'tasks', id));
   const shift = (n) => { const d = new Date(date + 'T00:00'); d.setDate(d.getDate() + n); setDate(iso(d)); };
+
+  // Label management with deletion
+  const addLabel = (name) => {
+    if (!name?.trim()) return;
+    return addDoc(collection(db, ...base, 'labels'), { name: name.trim() });
+  };
+
+  const delLabel = async (id, name) => {
+    if (!id) return;
+    try {
+      await deleteDoc(doc(db, ...base, 'labels', id));
+      // Remove this label ID from any tasks that have it
+      tasks
+        .filter((t) => t.labelIds?.includes(id))
+        .forEach((t) => {
+          updateDoc(doc(db, ...base, 'tasks', t.id), { labelIds: arrayRemove(id) });
+        });
+      if (view === 'label:' + id) {
+        setView('day');
+      }
+    } catch (e) {
+      console.error('Failed to delete label:', e);
+    }
+  };
+
+  // Voice command handlers across all application features
+  const completeTaskVoice = async (query) => {
+    const qLower = query.toLowerCase().trim();
+    if (qLower === 'all' || qLower === 'all tasks' || qLower === 'everything') {
+      const dayTasks = tasks.filter((t) => t.date === date && !t.done);
+      for (const t of dayTasks) {
+        await upd(t.id, { done: true });
+      }
+      return;
+    }
+    const matched = tasks.find((t) => t.text.toLowerCase().includes(qLower));
+    if (matched) {
+      await upd(matched.id, { done: true });
+    }
+  };
+
+  const deleteTaskVoice = async (query) => {
+    const qLower = query.toLowerCase().trim();
+    const matched = tasks.find((t) => t.text.toLowerCase().includes(qLower));
+    if (matched) {
+      await del(matched.id);
+    }
+  };
+
+  const addTargetVoice = async (name, deadline, note) => {
+    if (!name?.trim()) return;
+    await addDoc(collection(db, ...base, 'targets'), {
+      name: name.trim(),
+      deadline: deadline || date,
+      note: note || '',
+      pinned: false,
+      createdAt: Date.now(),
+    });
+  };
+
+  const pinTargetVoice = async (query) => {
+    const qLower = query.toLowerCase().trim();
+    const matched = targets.find((t) => t.name.toLowerCase().includes(qLower));
+    if (matched) {
+      targets.forEach((t) => updateDoc(doc(db, ...base, 'targets', t.id), { pinned: t.id === matched.id }));
+    }
+  };
+
+  const deleteTargetVoice = async (query) => {
+    const qLower = query.toLowerCase().trim();
+    const matched = targets.find((t) => t.name.toLowerCase().includes(qLower));
+    if (matched) {
+      await deleteDoc(doc(db, ...base, 'targets', matched.id));
+    }
+  };
+
+  const addEventVoice = async (title, evDate, time, type) => {
+    if (!title?.trim()) return;
+    await addDoc(collection(db, ...base, 'events'), {
+      title: title.trim(),
+      date: evDate || date,
+      time: time || '',
+      type: type || 'test',
+    });
+  };
+
+  const deleteEventVoice = async (query) => {
+    const qLower = query.toLowerCase().trim();
+    const matched = events.find((e) => e.title.toLowerCase().includes(qLower));
+    if (matched) {
+      await deleteDoc(doc(db, ...base, 'events', matched.id));
+    }
+  };
+
+  const deleteLabelVoice = async (name) => {
+    const qLower = name.toLowerCase().trim();
+    const matched = labels.find((l) => l.name.toLowerCase().includes(qLower));
+    if (matched) {
+      await delLabel(matched.id, matched.name);
+    }
+  };
+
+  const updateSettingsVoice = (patch) => {
+    if (patch.collapsed === '__toggle__') {
+      save({ collapsed: !s.collapsed });
+    } else {
+      save(patch);
+    }
+  };
 
   const day = tasks.filter((t) => t.date === date).sort((a, b) => a.createdAt - b.createdAt);
   const checks = day.filter((t) => t.type === 'task');
@@ -222,6 +411,7 @@ function Main({ user }) {
   const status = !online ? { c: 'off', t: 'Offline (saved locally)' } : sync === 'syncing' ? { c: 'sync', t: 'Syncing…' } : { c: 'ok', t: 'Synced' };
   const lid = view.startsWith('label:') ? view.slice(6) : null;
   const lt = lid ? tasks.filter((t) => t.labelIds?.includes(lid)) : [];
+  const currentLabelObj = lid ? labels.find((l) => l.id === lid) : null;
   const nav = (v, icon, text) => (
     <button key={v} className={'nav' + (view === v ? ' on' : '')} title={text} onClick={() => setView(v)}><i className={'ti ' + icon} /><span className="lbl">{text}</span></button>
   );
@@ -235,9 +425,38 @@ function Main({ user }) {
         {nav('calendar', 'ti-calendar', 'Calendar')}
         {nav('analysis', 'ti-chart-bar', 'Analysis')}
         {nav('targets', 'ti-target', 'Targets')}
-        <div className="muted lbl grp">Labels</div>
-        {labels.map((l) => nav('label:' + l.id, 'ti-tag', l.name))}
-        <form className="lab-add" onSubmit={(e) => { e.preventDefault(); nl.trim() && addDoc(collection(db, ...base, 'labels'), { name: nl.trim() }); setNl(''); }}>
+        
+        {/* Labels with deletion button */}
+        <div className="muted lbl grp" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>Labels</span>
+          <span style={{ fontSize: 11, opacity: 0.6 }}>({labels.length})</span>
+        </div>
+        <div className="labels-nav-group">
+          {labels.map((l) => (
+            <div key={l.id} className="label-nav-item">
+              <button
+                className={'nav' + (view === 'label:' + l.id ? ' on' : '')}
+                title={l.name}
+                onClick={() => setView('label:' + l.id)}
+              >
+                <i className="ti ti-tag" />
+                <span className="lbl">{l.name}</span>
+              </button>
+              <button
+                type="button"
+                className="label-del-btn"
+                title={`Remove label "${l.name}"`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  delLabel(l.id, l.name);
+                }}
+              >
+                <i className="ti ti-trash" />
+              </button>
+            </div>
+          ))}
+        </div>
+        <form className="lab-add" onSubmit={(e) => { e.preventDefault(); addLabel(nl); setNl(''); }}>
           <input value={nl} onChange={(e) => setNl(e.target.value)} placeholder="New label" />
         </form>
         <div className="grow" />
@@ -258,10 +477,31 @@ function Main({ user }) {
         {view === 'targets' && <Targets targets={targets} base={base} />}
         {lid && (
           <div>
-            <h2>{labels.find((l) => l.id === lid)?.name}</h2>
-            {!lt.length && <p className="muted">Nothing here yet. Add this label to a task from the Day view.</p>}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+              <h2>{currentLabelObj?.name || 'Label'}</h2>
+              <button
+                type="button"
+                className="pill"
+                style={{
+                  background: '#ef44441c',
+                  color: '#f87171',
+                  border: '1px solid #ef444438',
+                  fontSize: 12,
+                  padding: '6px 14px',
+                }}
+                onClick={() => {
+                  if (currentLabelObj) delLabel(currentLabelObj.id, currentLabelObj.name);
+                }}
+              >
+                <i className="ti ti-trash" /> Remove Label
+              </button>
+            </div>
+            {!lt.length && <p className="muted">Nothing here yet. Add this label to a task from the Day view or by voice.</p>}
             {[...new Set(lt.map((t) => t.date))].sort().reverse().map((d) => (
-              <div className="card" key={d} style={{ marginTop: 12 }}><h3>{d}</h3>{lt.filter((t) => t.date === d).map((t) => <Item key={t.id} t={t} {...p} />)}</div>
+              <div className="card" key={d} style={{ marginTop: 12 }}>
+                <h3>{d}</h3>
+                {lt.filter((t) => t.date === d).map((t) => <Item key={t.id} t={t} {...p} />)}
+              </div>
             ))}
           </div>
         )}
@@ -276,6 +516,7 @@ function Main({ user }) {
               </div>
               {s.showPercent && s.layout === 'columns' && <Progress pct={pct} done={nDone} total={checks.length} />}
             </header>
+
             <div className="evbar">
               {events.filter((e) => e.date === date).map((e) => <span key={e.id} className="ev" style={{ '--c': EV[e.type]?.[1] }} onClick={() => setEvm(e)}>{e.time && e.time + ' · '}{e.title}</span>)}
               <button className="evadd" onClick={() => setEvm({ date })}><i className="ti ti-plus" /> Event</button>
@@ -292,6 +533,32 @@ function Main({ user }) {
           </>
         )}
       </main>
+
+      {/* Global AI Voice Controller: Positioned fixed at bottom-right, enlarged suitably without text, controlling entire app */}
+      <AiVoiceMic
+        currentDate={date}
+        currentView={view}
+        labels={labels}
+        tasks={tasks}
+        targets={targets}
+        events={events}
+        settings={s}
+        onNavigateView={(targetView) => setView(targetView)}
+        onDateChange={(targetDate) => setDate(targetDate)}
+        onAddTask={(sec, txt, typ, d, lbl) => add(sec, txt, typ, d, lbl)}
+        onCompleteTask={(query) => completeTaskVoice(query)}
+        onDeleteTask={(query) => deleteTaskVoice(query)}
+        onAddTarget={(name, deadline, note) => addTargetVoice(name, deadline, note)}
+        onPinTarget={(query) => pinTargetVoice(query)}
+        onDeleteTarget={(query) => deleteTargetVoice(query)}
+        onAddEvent={(title, evDate, time, type) => addEventVoice(title, evDate, time, type)}
+        onDeleteEvent={(query) => deleteEventVoice(query)}
+        onAddLabel={(name) => addLabel(name)}
+        onDeleteLabel={(name) => deleteLabelVoice(name)}
+        onUpdateSettings={(patch) => updateSettingsVoice(patch)}
+        onToggleSettingsModal={(isOpen) => setOpen(isOpen)}
+        onSignOut={() => signOut(auth)}
+      />
 
       {evm && <EventModal ev={evm} base={base} onClose={() => setEvm(null)} />}
       {open && (
@@ -451,10 +718,6 @@ function Analysis({ tasks, labels, upd, del }) {
         <div className="card"><div className="muted">Completion</div><div className="big">{pct(done, rt.length)}%</div><div className="bar"><i style={{ width: pct(done, rt.length) + '%' }} /></div></div>
         <div className="card"><div className="muted">Backlog (before today)</div><div className="big" style={{ color: backlog ? '#f87171' : undefined }}>{backlog}</div></div>
       </div>
-      <div className="card" style={{ marginTop: 12 }}>
-        <h3>Last 14 days</h3>
-        <div className="trend">{trend.map((x) => <div key={x.k} className="tb" title={`${x.k}: ${x.done}/${x.total} done`}><div className="tc"><i style={{ height: (x.total ? Math.max(6, pct(x.done, x.total)) : 3) + '%', opacity: x.total ? 1 : 0.25 }} /></div><span className="muted">{+x.k.slice(8)}</span></div>)}</div>
-      </div>
       <div className="cols" style={{ marginTop: 12 }}>
         <div className="card"><h3>By section</h3>{SECTIONS.map(([id, n]) => arow(n, rt.filter((t) => t.section === id)))}</div>
         <div className="card"><h3>By label</h3>{byLabel.length ? byLabel.map(([n, a]) => arow(n, a)) : <div className="muted">Add labels to tasks to see progress by topic.</div>}</div>
@@ -482,6 +745,10 @@ function Analysis({ tasks, labels, upd, del }) {
             })}
           </div>
         ))}
+      </div>
+      <div className="card" style={{ marginTop: 12 }}>
+        <h3>Last 14 days</h3>
+        <div className="trend">{trend.map((x) => <div key={x.k} className="tb" title={`${x.k}: ${x.done}/${x.total} done`}><div className="tc"><i style={{ height: (x.total ? Math.max(6, pct(x.done, x.total)) : 3) + '%', opacity: x.total ? 1 : 0.25 }} /></div><span className="muted">{+x.k.slice(8)}</span></div>)}</div>
       </div>
     </div>
   );

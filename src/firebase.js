@@ -1,256 +1,195 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
-  onAuthStateChanged as realOnAuthStateChanged,
-  signInWithPopup as realSignInWithPopup,
-  signInWithRedirect as realSignInWithRedirect,
-  getRedirectResult as realGetRedirectResult,
-  signOut as realSignOut,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
 } from 'firebase/auth';
 import {
+  getFirestore,
   initializeFirestore,
   persistentLocalCache,
-  collection as realCollection,
-  doc as realDoc,
-  addDoc as realAddDoc,
-  updateDoc as realUpdateDoc,
-  deleteDoc as realDeleteDoc,
-  setDoc as realSetDoc,
-  onSnapshot as realOnSnapshot,
-  arrayUnion as realArrayUnion,
-  arrayRemove as realArrayRemove,
+  persistentMultipleTabManager,
+  persistentSingleTabManager,
+  memoryLocalCache,
+  collection,
+  doc,
+  addDoc as firestoreAddDoc,
+  updateDoc as firestoreUpdateDoc,
+  deleteDoc as firestoreDeleteDoc,
+  setDoc as firestoreSetDoc,
+  onSnapshot as firestoreOnSnapshot,
+  arrayUnion,
+  arrayRemove,
 } from 'firebase/firestore';
-import { localStore } from './localStore';
+import firebaseConfig from '../firebase-applet-config.json';
 
-const e = import.meta.env;
-// true only when the .env values have been filled in
-export const configured = Boolean(e.VITE_FIREBASE_API_KEY && e.VITE_FIREBASE_PROJECT_ID);
+// Initialize or reuse live Firebase App
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
-let app = null;
-let auth = null;
-let db = null;
-let provider = null;
+// Initialize Firestore with robust local cache persistence fallback for iframes and browsers
+function createFirestoreInstance() {
+  const dbId = firebaseConfig.firestoreDatabaseId;
 
-if (configured) {
+  // Attempt 1: Multi-tab persistent local cache
   try {
-    app = initializeApp({
-      apiKey: e.VITE_FIREBASE_API_KEY,
-      authDomain: e.VITE_FIREBASE_AUTH_DOMAIN,
-      projectId: e.VITE_FIREBASE_PROJECT_ID,
-      storageBucket: e.VITE_FIREBASE_STORAGE_BUCKET,
-      messagingSenderId: e.VITE_FIREBASE_MESSAGING_SENDER_ID,
-      appId: e.VITE_FIREBASE_APP_ID,
-    });
-    auth = getAuth(app);
-    provider = new GoogleAuthProvider();
-    provider.setCustomParameters({ prompt: 'select_account' });
-    db = initializeFirestore(app, { localCache: persistentLocalCache() });
-  } catch (err) {
-    console.warn('Firebase initialization error:', err);
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      },
+      dbId
+    );
+  } catch (e1) {
+    console.warn('[Firestore] Multi-tab persistence not supported in this frame, trying single-tab...', e1?.message);
   }
+
+  // Attempt 2: Single-tab persistent local cache (widely supported in iframes)
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache({
+          tabManager: persistentSingleTabManager(),
+        }),
+      },
+      dbId
+    );
+  } catch (e2) {
+    console.warn('[Firestore] Single-tab persistence failed, trying default local cache...', e2?.message);
+  }
+
+  // Attempt 3: Default persistent cache
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache(),
+      },
+      dbId
+    );
+  } catch (e3) {
+    console.warn('[Firestore] Persistent cache failed, trying memory cache...', e3?.message);
+  }
+
+  // Attempt 4: In-memory local cache
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: memoryLocalCache(),
+      },
+      dbId
+    );
+  } catch (e4) {
+    console.warn('[Firestore] initializeFirestore failed, falling back to getFirestore...', e4?.message);
+  }
+
+  // Attempt 5: Standard getFirestore
+  return getFirestore(app, dbId);
 }
 
-// Guest user state & persistence
-const GUEST_KEY = 'jee_planner_guest_active';
-let isGuestActive = false;
-try {
-  isGuestActive = localStorage.getItem(GUEST_KEY) === 'true';
-} catch {
-  // ignore
-}
+export const db = createFirestoreInstance();
 
-export const GUEST_USER = {
-  uid: 'guest',
-  displayName: 'JEE Aspirant',
-  email: 'aspirant@jee.local',
-  photoURL: '',
-  isGuest: true,
+export const auth = getAuth(app);
+export const provider = new GoogleAuthProvider();
+provider.setCustomParameters({ prompt: 'select_account' });
+
+export const configured = true;
+
+// Operation types for error handling
+export const OperationType = {
+  CREATE: 'create',
+  UPDATE: 'update',
+  DELETE: 'delete',
+  LIST: 'list',
+  GET: 'get',
+  WRITE: 'write',
 };
 
-const authListeners = new Set();
-
-export function onAuthStateChanged(authInstance, callback) {
-  authListeners.add(callback);
-
-  if (isGuestActive) {
-    callback(GUEST_USER);
-  } else if (configured && auth) {
-    return realOnAuthStateChanged(auth, (user) => {
-      if (!isGuestActive) {
-        callback(user);
-      }
-    });
-  } else {
-    callback(null);
-  }
-
-  return () => {
-    authListeners.delete(callback);
+export function handleFirestoreError(error, operationType, path) {
+  const errInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    code: error?.code || 'unknown',
+    authInfo: {
+      userId: auth.currentUser?.uid || null,
+      email: auth.currentUser?.email || null,
+    },
+    operationType,
+    path,
   };
+  console.warn('[Firestore Notice]:', JSON.stringify(errInfo));
+  // Note: Do not throw from async listeners to avoid crashing the React UI
+  return errInfo;
 }
 
-export function signInGuest() {
-  isGuestActive = true;
-  try {
-    localStorage.setItem(GUEST_KEY, 'true');
-  } catch {
-    // ignore
-  }
-  authListeners.forEach((fn) => fn(GUEST_USER));
-}
-
-export async function signOut(authInstance) {
-  if (isGuestActive) {
-    isGuestActive = false;
-    try {
-      localStorage.removeItem(GUEST_KEY);
-    } catch {
-      // ignore
-    }
-    authListeners.forEach((fn) => fn(null));
-    return;
-  }
-  if (configured && auth) {
-    await realSignOut(auth);
-  }
-}
-
-export async function signInWithPopup(authInstance, providerInstance) {
-  if (configured && auth) {
-    return await realSignInWithPopup(auth, providerInstance || provider);
-  }
-  signInGuest();
-  return { user: GUEST_USER };
-}
-
-export async function signInWithRedirect(authInstance, providerInstance) {
-  if (configured && auth) {
-    return await realSignInWithRedirect(auth, providerInstance || provider);
-  }
-  signInGuest();
-}
-
-export async function getRedirectResult(authInstance) {
-  if (configured && auth) {
-    return await realGetRedirectResult(auth);
-  }
-  return null;
-}
-
-export function collection(dbInstance, ...segments) {
-  return {
-    _type: 'collection',
-    path: segments,
-    db: dbInstance,
-  };
-}
-
-export function doc(dbInstance, ...segments) {
-  return {
-    _type: 'doc',
-    path: segments,
-    db: dbInstance,
-  };
-}
-
-export function arrayUnion(...elements) {
-  const fv = (configured && db) ? realArrayUnion(...elements) : {};
-  fv._mockOp = 'arrayUnion';
-  fv._elements = elements;
-  return fv;
-}
-
-export function arrayRemove(...elements) {
-  const fv = (configured && db) ? realArrayRemove(...elements) : {};
-  fv._mockOp = 'arrayRemove';
-  fv._elements = elements;
-  return fv;
-}
-
-export function onSnapshot(ref, optionsOrCb, maybeCb) {
-  const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
-  const isGuest = isGuestActive || !configured || ref.path?.[1] === 'guest';
-
-  if (isGuest) {
-    const notify = () => {
-      if (ref._type === 'collection') {
-        const colName = ref.path[ref.path.length - 1];
-        const items = localStore.getCollection(colName);
-        cb({
-          docs: items.map((item) => ({
-            id: item.id,
-            data: () => item,
-          })),
-          metadata: { hasPendingWrites: false, fromCache: false },
-        });
-      } else {
-        const colName = ref.path[ref.path.length - 2];
-        const docId = ref.path[ref.path.length - 1];
-        const item = localStore.getDoc(colName, docId);
-        cb({
-          id: docId,
-          exists: () => Boolean(item),
-          data: () => item || {},
-          metadata: { hasPendingWrites: false, fromCache: false },
-        });
-      }
-    };
-
-    notify();
-    return localStore.subscribe(notify);
-  }
-
-  if (ref._type === 'collection') {
-    const realRef = realCollection(db, ...ref.path);
-    return realOnSnapshot(realRef, optionsOrCb, maybeCb);
-  } else {
-    const realRef = realDoc(db, ...ref.path);
-    return realOnSnapshot(realRef, optionsOrCb, maybeCb);
-  }
-}
-
+// Wrapped Firestore mutations with safe error handling
 export async function addDoc(colRef, data) {
-  const isGuest = isGuestActive || !configured || colRef.path?.[1] === 'guest';
-  if (isGuest) {
-    const colName = colRef.path[colRef.path.length - 1];
-    return localStore.addDoc(colName, data);
+  try {
+    return await firestoreAddDoc(colRef, data);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, colRef.path || 'collection');
+    throw err;
   }
-  const realRef = realCollection(db, ...colRef.path);
-  return await realAddDoc(realRef, data);
 }
 
 export async function updateDoc(docRef, patch) {
-  const isGuest = isGuestActive || !configured || docRef.path?.[1] === 'guest';
-  if (isGuest) {
-    const colName = docRef.path[docRef.path.length - 2];
-    const docId = docRef.path[docRef.path.length - 1];
-    return localStore.updateDoc(colName, docId, patch);
+  try {
+    return await firestoreUpdateDoc(docRef, patch);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, docRef.path || 'document');
+    throw err;
   }
-  const realRef = realDoc(db, ...docRef.path);
-  return await realUpdateDoc(realRef, patch);
 }
 
 export async function deleteDoc(docRef) {
-  const isGuest = isGuestActive || !configured || docRef.path?.[1] === 'guest';
-  if (isGuest) {
-    const colName = docRef.path[docRef.path.length - 2];
-    const docId = docRef.path[docRef.path.length - 1];
-    return localStore.deleteDoc(colName, docId);
+  try {
+    return await firestoreDeleteDoc(docRef);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, docRef.path || 'document');
+    throw err;
   }
-  const realRef = realDoc(db, ...docRef.path);
-  return await realDeleteDoc(realRef);
 }
 
 export async function setDoc(docRef, data) {
-  const isGuest = isGuestActive || !configured || docRef.path?.[1] === 'guest';
-  if (isGuest) {
-    const colName = docRef.path[docRef.path.length - 2];
-    const docId = docRef.path[docRef.path.length - 1];
-    return localStore.setDoc(colName, docId, data);
+  try {
+    return await firestoreSetDoc(docRef, data);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, docRef.path || 'document');
+    throw err;
   }
-  const realRef = realDoc(db, ...docRef.path);
-  return await realSetDoc(realRef, data);
 }
 
-export { auth, provider, db };
+export function onSnapshot(targetRef, optionsOrCb, maybeCb) {
+  const path = targetRef.path || 'snapshot';
+  if (typeof optionsOrCb === 'function') {
+    return firestoreOnSnapshot(
+      targetRef,
+      optionsOrCb,
+      (err) => handleFirestoreError(err, OperationType.GET, path)
+    );
+  }
+  return firestoreOnSnapshot(
+    targetRef,
+    optionsOrCb,
+    maybeCb,
+    (err) => handleFirestoreError(err, OperationType.GET, path)
+  );
+}
+
+export {
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
+  collection,
+  doc,
+  arrayUnion,
+  arrayRemove,
+};

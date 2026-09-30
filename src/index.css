@@ -148,3 +148,53 @@ details{margin-top:10px;color:var(--muted)}
 .gbtn{background:#fff;color:#111;border-radius:12px;padding:12px 20px;font-weight:600;justify-content:center;gap:10px;width:100%}
 .gbtn:hover{background:#f1f1f1}.gbtn:disabled{opacity:.6;cursor:default}
 .err{color:#f87171;font-size:13px}
+
+/* Label navigation item with removal option */
+.labels-nav-group{display:flex;flex-direction:column;gap:2px}
+.label-nav-item{display:flex;align-items:center;position:relative;border-radius:12px;transition:background .2s}
+.label-nav-item .nav{flex:1;min-width:0}
+.label-del-btn{position:absolute;right:6px;opacity:0;padding:5px 7px;border-radius:8px;color:var(--muted);transition:all .2s;font-size:13px;background:none;border:none;cursor:pointer}
+.label-nav-item:hover .label-del-btn{opacity:0.8}
+.label-del-btn:hover{opacity:1;color:#f87171;background:#f8717124}
+.mini .label-del-btn{display:none}
+
+/* SUITABLY ENLARGED FLOATING MIC TOGGLE (NO TEXT) IN BOTTOM RIGHT */
+.ai-voice-floating-container{position:fixed;bottom:24px;right:24px;left:auto;z-index:1000}
+.ai-fab-mic-btn{position:relative;width:58px;height:58px;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--accent) 26%,#151518);border:2px solid color-mix(in srgb,var(--accent) 70%,transparent);color:var(--accent);cursor:pointer;box-shadow:0 8px 32px #00000099,0 0 20px color-mix(in srgb,var(--accent) 35%,transparent);transition:transform .35s var(--spring),background .3s,border-color .3s,box-shadow .3s}
+.ai-fab-mic-btn:hover{transform:scale(1.1);background:color-mix(in srgb,var(--accent) 38%,#1a1a1f);border-color:var(--accent);box-shadow:0 12px 40px #000000cc,0 0 30px color-mix(in srgb,var(--accent) 60%,transparent)}
+.ai-fab-mic-btn:active{transform:scale(0.94)}
+.ai-fab-icon-wrap{font-size:26px;display:grid;place-items:center}
+
+.ai-fab-mic-btn.listening{background:color-mix(in srgb,#ef4444 30%,#151518);border-color:#ef4444;color:#fca5a5;box-shadow:0 0 34px color-mix(in srgb,#ef4444 70%,transparent);animation:fab-pulse 1.35s infinite}
+.ai-fab-mic-btn.analyzing{background:color-mix(in srgb,var(--accent) 45%,#18181c);border-color:var(--accent);color:#fff}
+
+@keyframes fab-pulse{
+  0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,#ef4444 55%,transparent),0 8px 30px #000000aa}
+  50%{box-shadow:0 0 0 16px transparent,0 8px 30px #000000aa}
+}
+
+.ai-fab-ripples{position:absolute;inset:-6px;border-radius:50%;pointer-events:none}
+.ai-ripple-1,.ai-ripple-2{position:absolute;inset:0;border-radius:50%;border:2px solid #ef4444;animation:ai-ripple-out 1.7s cubic-bezier(0,0.2,0.8,1) infinite}
+.ai-ripple-2{animation-delay:.55s}
+@keyframes ai-ripple-out{
+  0%{transform:scale(1);opacity:.85}
+  100%{transform:scale(1.6);opacity:0}
+}
+
+/* Floating live HUD popping up above the mic in bottom right */
+.ai-voice-live-hud{position:absolute;bottom:72px;right:0;left:auto;min-width:280px;max-width:360px;background:#16161af4;backdrop-filter:blur(22px);border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);border-radius:18px;padding:14px;display:grid;gap:10px;box-shadow:0 16px 42px #000000cc;animation:pop .4s var(--spring) both;z-index:1001}
+.ai-voice-live-hud.analyzing{border-color:var(--accent)}
+.ai-voice-live-hud.feedback{border-color:#22c55e66;background:color-mix(in srgb,#22c55e 12%,#16161af4)}
+.ai-voice-live-hud.error{border-color:#ef444466;background:color-mix(in srgb,#ef4444 12%,#16161af4);color:#f87171;display:flex;align-items:center;gap:8px;font-size:12px}
+
+.ai-listening-indicator{display:flex;align-items:center;gap:8px;font-size:12px;color:#fca5a5}
+.ai-dot-pulse{width:8px;height:8px;border-radius:50%;background:#ef4444;animation:pulse 0.9s infinite}
+.ai-transcript-preview{font-size:13px;color:var(--text);font-style:italic;background:#0c0c0e99;padding:9px 12px;border-radius:10px;min-height:36px;display:flex;align-items:center;line-height:1.4}
+.ai-live-actions{display:flex;gap:10px;align-items:center}
+.ai-analyzing-content{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text)}
+.ai-feedback-header{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;color:#f4f4f5}
+.ai-feedback-text{flex:1;word-break:break-word}
+
+.ai-spin{animation:spin 1.2s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
