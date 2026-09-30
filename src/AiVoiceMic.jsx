@@ -1,4 +1,15 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { auth } from './firebase';
+
+// Sends the signed-in user's Firebase token so the server can verify who is calling
+async function authHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  try {
+    const t = await auth?.currentUser?.getIdToken();
+    if (t) h.Authorization = 'Bearer ' + t;
+  } catch {}
+  return h;
+}
 
 // SILENT AI: Speech synthesis completely disabled per user request
 function speakFeedback() {
@@ -412,7 +423,7 @@ export default function AiVoiceMic({
 
         const res = await fetch('/api/transcribe-audio', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: await authHeaders(),
           body: JSON.stringify({ audioBase64: b64, mimeType: 'audio/wav' }),
         });
 
@@ -720,7 +731,7 @@ export default function AiVoiceMic({
         try {
           const res = await fetch('/api/parse-voice-command', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: await authHeaders(),
             body: JSON.stringify(payload),
             signal: abortCtrl.signal,
           });
