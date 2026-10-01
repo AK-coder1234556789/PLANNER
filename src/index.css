@@ -283,7 +283,7 @@ details{margin-top:10px;color:var(--muted)}
 .ai-wake-banner{position:absolute;bottom:72px;right:0;background:linear-gradient(135deg,#1c1917f8,#18181bf8);backdrop-filter:blur(20px);border:1.5px solid var(--accent);color:#fff;padding:8px 18px;border-radius:999px;display:flex;align-items:center;gap:10px;font-size:12px;font-weight:600;white-space:nowrap;box-shadow:0 12px 36px #000000dd;animation:pop .25s var(--spring) both;z-index:1002;pointer-events:none}
 .ai-wake-dot{width:8px;height:8px;border-radius:50%;background:#4ade80;animation:pulse 0.7s infinite;box-shadow:0 0 8px #4ade80}
 
-/* Voice Match Setup Modal (Google Assistant Style) */
+/* Voice Match Setup & Calibration Modal */
 .voice-match-backdrop{position:fixed;inset:0;background:#000000bb;backdrop-filter:blur(14px);display:grid;place-items:center;z-index:99999;padding:16px;animation:fade .2s ease-out}
 .voice-match-card{width:100%;max-width:440px;background:#141417;border:1px solid #27272a;border-radius:24px;padding:28px 24px;box-shadow:0 24px 60px #000000ee;position:relative;display:grid;gap:18px;text-align:center;animation:pop .3s var(--spring) both}
 .voice-match-rings-wrap{position:relative;width:96px;height:96px;margin:0 auto;display:grid;place-items:center}
@@ -353,16 +353,104 @@ details{margin-top:10px;color:var(--muted)}
 .ai-wake-active-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e;animation:wakePulse 1.8s infinite}
 .ai-wake-form-group{display:grid;gap:5px}
 
-/* Google Assistant 4-Color Wave Indicator */
-.google-assistant-wave{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#121624,#15151c);border:1px solid #2a344d;border-radius:12px;padding:9px 12px;box-shadow:0 4px 14px rgba(0,0,0,0.4)}
-.ga-dots-group{display:flex;align-items:center;gap:5px}
-.ga-dot{width:9px;height:9px;border-radius:50%;display:inline-block;animation:gaBounce 1.2s infinite ease-in-out}
-.ga-dot.blue{background:#4285F4;box-shadow:0 0 8px rgba(66,133,244,0.7);animation-delay:0s}
-.ga-dot.red{background:#EA4335;box-shadow:0 0 8px rgba(234,67,53,0.7);animation-delay:0.18s}
-.ga-dot.yellow{background:#FBBC05;box-shadow:0 0 8px rgba(251,188,5,0.7);animation-delay:0.36s}
-.ga-dot.green{background:#34A853;box-shadow:0 0 8px rgba(52,168,83,0.7);animation-delay:0.54s}
-@keyframes gaBounce{0%,80%,100%{transform:scale(0.85);opacity:0.7}40%{transform:scale(1.35) translateY(-3px);opacity:1}}
-.ga-text{font-size:12px;font-weight:600;color:#f4f4f5;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Prominent Wake Word Activated Hero Banner (Top-Center of Screen) */
+.ai-wake-active-hero-banner{
+  position:fixed;
+  top:24px;
+  left:50%;
+  transform:translateX(-50%);
+  z-index:99999;
+  background:linear-gradient(135deg,#1c1815,#141418);
+  border:2px solid var(--accent);
+  box-shadow:0 12px 40px rgba(0,0,0,0.85), 0 0 28px color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius:20px;
+  padding:12px 24px;
+  display:flex;
+  align-items:center;
+  gap:16px;
+  animation:slideDownPop .35s var(--spring) both;
+  pointer-events:auto;
+}
+@keyframes slideDownPop{
+  0%{opacity:0;transform:translate(-50%,-20px) scale(0.92)}
+  100%{opacity:1;transform:translate(-50%,0) scale(1)}
+}
+.ai-wake-hero-dot{
+  width:14px;
+  height:14px;
+  border-radius:50%;
+  background:#22c55e;
+  box-shadow:0 0 12px #22c55e;
+  animation:wakePulse 1s infinite alternate;
+}
+.ai-wake-hero-text{
+  display:grid;
+  gap:2px;
+}
+.ai-wake-hero-title{
+  font-size:14px;
+  font-weight:700;
+  color:#fff;
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.ai-wake-hero-title b{
+  color:var(--accent);
+}
+.ai-wake-hero-sub{
+  font-size:12px;
+  color:#a1a1aa;
+}
+.ai-wake-hero-waves{
+  display:flex;
+  align-items:center;
+  gap:3px;
+  height:20px;
+}
+.ai-wake-hero-waves .wave-bar{
+  width:4px;
+  height:8px;
+  background:var(--accent);
+  border-radius:999px;
+  animation:soundWave 0.8s ease-in-out infinite alternate;
+}
+.ai-wake-hero-waves .wave-bar:nth-child(2){animation-delay:0.15s;height:16px}
+.ai-wake-hero-waves .wave-bar:nth-child(3){animation-delay:0.3s;height:12px}
+.ai-wake-hero-waves .wave-bar:nth-child(4){animation-delay:0.45s;height:18px}
+@keyframes soundWave{
+  0%{transform:scaleY(0.4)}
+  100%{transform:scaleY(1.4)}
+}
+
+/* Voice Controller Live Bar in HUD */
+.ai-assistant-live-bar{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  background:linear-gradient(135deg,#1f1c19,#17171c);
+  border:1px solid #332d28;
+  border-radius:12px;
+  padding:9px 12px;
+  box-shadow:0 4px 14px rgba(0,0,0,0.4);
+}
+.ai-live-accent-dot{
+  width:10px;
+  height:10px;
+  border-radius:50%;
+  background:var(--accent);
+  box-shadow:0 0 10px var(--accent);
+  animation:wakePulse 1s infinite alternate;
+}
+.ai-live-text{
+  font-size:12px;
+  font-weight:600;
+  color:#f4f4f5;
+  flex:1;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
 
 
 
