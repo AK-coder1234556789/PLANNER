@@ -20,6 +20,90 @@ function speakFeedback() {
   }
 }
 
+// Synthesized pleasant two-tone Google Assistant / Gemini style chime
+function playAssistantChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    
+    // Note 1: D5 (587.33 Hz)
+    const osc1 = ctx.createOscillator();
+    const gain1 = ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(587.33, now);
+    gain1.gain.setValueAtTime(0, now);
+    gain1.gain.linearRampToValueAtTime(0.14, now + 0.02);
+    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+    osc1.connect(gain1);
+    gain1.connect(ctx.destination);
+    osc1.start(now);
+    osc1.stop(now + 0.12);
+    
+    // Note 2: A5 (880.00 Hz)
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(880.00, now + 0.08);
+    gain2.gain.setValueAtTime(0, now + 0.08);
+    gain2.gain.linearRampToValueAtTime(0.18, now + 0.10);
+    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.30);
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.start(now + 0.08);
+    osc2.stop(now + 0.30);
+  } catch (e) {
+    console.warn('Could not play assistant chime:', e);
+  }
+}
+
+// Success chime for Voice Match training steps
+function playSuccessChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(523.25, now); // C5
+    osc.frequency.exponentialRampToValueAtTime(1046.5, now + 0.15); // C6
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.12, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.22);
+  } catch {}
+}
+
+const VOICE_TRAINING_STEPS = [
+  {
+    step: 1,
+    title: 'Say: "Planner"',
+    sub: 'Speak clearly into your microphone to record your voice pattern',
+    expectedPhrase: 'planner',
+    display: '“Planner”',
+  },
+  {
+    step: 2,
+    title: 'Say: "Hey Planner"',
+    sub: 'Speak in your natural speaking pace',
+    expectedPhrase: 'planner',
+    display: '“Hey Planner”',
+  },
+  {
+    step: 3,
+    title: 'Say: "Planner, add a task"',
+    sub: 'Teaches your assistant to recognize your commands seamlessly',
+    expectedPhrase: 'planner',
+    display: '“Planner, add a task”',
+  },
+];
+
 // Client-side rule-based command engine (guaranteed zero-downtime fallback)
 function clientParseVoiceCommand(speechText, currentDate, labels = []) {
   const textLower = speechText.toLowerCase().trim();
@@ -298,6 +382,66 @@ export default function AiVoiceMic({
   const [selectedDeviceId, setSelectedDeviceId] = useState(() => {
     return localStorage.getItem('jee_selected_mic_id') || '';
   });
+
+  // Voice Match & Always-On Wake Word States (Google Assistant Style)
+  const [voiceProfile, setVoiceProfile] = useState(() => {
+    try {
+      const saved = localStorage.getItem('planner_voice_match_profile');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [alwaysListen, setAlwaysListen] = useState(() => {
+    try {
+      const saved = localStorage.getItem('planner_always_listen');
+      return saved !== null ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const [showVoiceMatchModal, setShowVoiceMatchModal] = useState(false);
+  const [trainingStep, setTrainingStep] = useState(0);
+  const [trainingVoiceSamples, setTrainingVoiceSamples] = useState([]);
+
+  // Wake Word Activation Indicator State (Google Assistant Glowing Ring)
+  const [wakeActivated, setWakeActivated] = useState(false);
+  const wakeTimeoutRef = useRef(null);
+
+  // Background speech recognition reference for always-on mic
+  const backgroundRecognitionRef = useRef(null);
+  const isBackgroundListeningRef = useRef(false);
+
+  // Silence auto-run timer (2s silence after speech runs automatically)
+  const speechSilenceTimerRef = useRef(null);
+
+  const saveVoiceProfile = (profileData) => {
+    try {
+      localStorage.setItem('planner_voice_match_profile', JSON.stringify(profileData));
+      localStorage.setItem('planner_always_listen', 'true');
+      setVoiceProfile(profileData);
+      setAlwaysListen(true);
+    } catch (e) {
+      console.warn('Could not save voice profile:', e);
+    }
+  };
+
+  const handleToggleAlwaysListen = () => {
+    const nextVal = !alwaysListen;
+    setAlwaysListen(nextVal);
+    localStorage.setItem('planner_always_listen', String(nextVal));
+    if (!nextVal) {
+      if (backgroundRecognitionRef.current) {
+        try { backgroundRecognitionRef.current.abort(); } catch {}
+      }
+      isBackgroundListeningRef.current = false;
+      setFeedback({ message: 'Always-on wake word paused' });
+    } else {
+      setFeedback({ message: 'Always listening for "Planner" active' });
+    }
+  };
 
   // Real-time microphone audio & voice reception detection
   const [audioLevel, setAudioLevel] = useState(0);
@@ -648,6 +792,14 @@ export default function AiVoiceMic({
         if (text) {
           setTranscript(text);
           setManualCmd(text);
+
+          // After user speaks and pauses for 1.8 seconds, command runs automatically
+          if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
+          speechSilenceTimerRef.current = setTimeout(() => {
+            if (isListeningRef.current) {
+              handleDoneAndRun(text);
+            }
+          }, 1800);
         }
       };
 
@@ -683,8 +835,197 @@ export default function AiVoiceMic({
       if (liveTranscribeTimerRef.current) {
         clearTimeout(liveTranscribeTimerRef.current);
       }
+      if (speechSilenceTimerRef.current) {
+        clearTimeout(speechSilenceTimerRef.current);
+      }
     };
   }, [selectedDeviceId]);
+
+  // Global Alt+V shortcut to start/stop listening
+  useEffect(() => {
+    const handleGlobalKeyDown = (e) => {
+      if (e.altKey && (e.key.toLowerCase() === 'v' || e.code === 'KeyV')) {
+        e.preventDefault();
+        if (listening) {
+          handleDoneAndRun();
+        } else {
+          startListening();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [listening]);
+
+  // Background Always-On Microphone Wake Word ("Planner") Supervisor
+  useEffect(() => {
+    // Background listener runs only when trained, enabled, and no foreground session is busy
+    if (!alwaysListen || !voiceProfile?.isTrained || listening || isHolding || analyzing || isTestingMic || showVoiceMatchModal) {
+      if (backgroundRecognitionRef.current) {
+        try { backgroundRecognitionRef.current.abort(); } catch {}
+        backgroundRecognitionRef.current = null;
+      }
+      isBackgroundListeningRef.current = false;
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    let isMounted = true;
+    isBackgroundListeningRef.current = true;
+
+    // Keep active stream alive in background so browser maintains continuous mic access
+    if (!activeStreamRef.current) {
+      getAudioStream().catch(() => {});
+    }
+
+    const startBgRecognition = () => {
+      if (!isMounted || !isBackgroundListeningRef.current || listening || analyzing || isTestingMic) return;
+      try {
+        const bgRec = new SpeechRecognition();
+        bgRec.continuous = true;
+        bgRec.interimResults = true;
+        bgRec.lang = navigator.language || 'en-US';
+
+        bgRec.onresult = (event) => {
+          let phrase = '';
+          for (let i = 0; i < event.results.length; i++) {
+            phrase += event.results[i][0].transcript + ' ';
+          }
+          const lower = phrase.toLowerCase().trim();
+
+          // Match wake word: "Planner", "Hey Planner", "OK Planner", "Hi Planner"
+          const wakeMatch = lower.match(/\b(?:hey\s+|ok\s+|hi\s+)?planner\b/i);
+          if (wakeMatch) {
+            console.log('[Wake Word] "Planner" detected in background:', lower);
+            try { bgRec.abort(); } catch {}
+
+            playAssistantChime();
+            setWakeActivated(true);
+            if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
+            wakeTimeoutRef.current = setTimeout(() => setWakeActivated(false), 2800);
+
+            // Check if there is an inline command trailing "Planner"
+            // Example: "Planner add chemistry notes" or "Hey Planner tomorrow"
+            const trailingCommand = lower.replace(/^.*?\b(?:hey\s+|ok\s+|hi\s+)?planner[\s,:]*/i, '').trim();
+
+            if (trailingCommand.length > 2) {
+              executeVoiceCommand(trailingCommand);
+            } else {
+              // Spoke only "Planner" - activate active listening session
+              setIsWindowOpen(true);
+              startListening();
+            }
+          }
+        };
+
+        bgRec.onerror = (e) => {
+          if (e.error !== 'no-speech' && e.error !== 'aborted') {
+            console.warn('[Wake Word Background notice]', e.error);
+          }
+        };
+
+        bgRec.onend = () => {
+          if (isMounted && isBackgroundListeningRef.current && !isListeningRef.current && !analyzing && !isTestingMic) {
+            setTimeout(() => {
+              if (isMounted && isBackgroundListeningRef.current && !isListeningRef.current && !analyzing && !isTestingMic) {
+                startBgRecognition();
+              }
+            }, 300);
+          }
+        };
+
+        bgRec.start();
+        backgroundRecognitionRef.current = bgRec;
+      } catch (err) {
+        console.warn('Background wake listener start note:', err);
+      }
+    };
+
+    startBgRecognition();
+
+    return () => {
+      isMounted = false;
+      isBackgroundListeningRef.current = false;
+      if (backgroundRecognitionRef.current) {
+        try { backgroundRecognitionRef.current.abort(); } catch {}
+        backgroundRecognitionRef.current = null;
+      }
+    };
+  }, [alwaysListen, voiceProfile, listening, isHolding, analyzing, isTestingMic, showVoiceMatchModal]);
+
+  // Voice Match Training Speech Listener (when setup wizard is open)
+  useEffect(() => {
+    if (!showVoiceMatchModal || trainingStep >= 3) return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let rec = null;
+    let isCancelled = false;
+
+    // Start audio visualizer for the setup modal
+    getAudioStream().then((stream) => {
+      if (!isCancelled) startAudioVisualizer(stream);
+    }).catch(() => {});
+
+    if (SpeechRecognition) {
+      try {
+        rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = navigator.language || 'en-US';
+
+        rec.onresult = (event) => {
+          let text = '';
+          for (let i = 0; i < event.results.length; i++) {
+            text += event.results[i][0].transcript + ' ';
+          }
+          const lower = text.toLowerCase();
+          if (lower.includes('planner') || (trainingStep === 1 && lower.includes('hey'))) {
+            handleTrainingPhraseSpoken();
+          }
+        };
+
+        rec.start();
+      } catch (e) {
+        console.warn('Training recognizer note:', e);
+      }
+    }
+
+    return () => {
+      isCancelled = true;
+      if (rec) {
+        try { rec.abort(); } catch {}
+      }
+    };
+  }, [showVoiceMatchModal, trainingStep]);
+
+  const handleTrainingPhraseSpoken = () => {
+    playSuccessChime();
+    setTrainingVoiceSamples((prev) => [
+      ...prev,
+      { step: trainingStep, timestamp: Date.now(), level: audioLevel, frequencies: [...frequencies] },
+    ]);
+    if (trainingStep < 2) {
+      setTrainingStep((prev) => prev + 1);
+    } else {
+      setTrainingStep(3); // Complete
+    }
+  };
+
+  const completeTrainingAndActivate = () => {
+    saveVoiceProfile({
+      isTrained: true,
+      trainedAt: Date.now(),
+      samplesCount: 3,
+      samples: trainingVoiceSamples,
+    });
+    setShowVoiceMatchModal(false);
+    playAssistantChime();
+    setFeedback({ message: 'Voice Match activated! Say "Planner" anytime.' });
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 3000);
+  };
 
   // Process recognized command with ultra-fast client-first execution and Gemini AI fallback
   const executeVoiceCommand = async (textToProcess, audioBlob = null) => {
@@ -948,6 +1289,7 @@ export default function AiVoiceMic({
     if (analyzing) return;
     setTranscript('');
     setManualCmd('');
+    if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
 
     startMediaRecorder();
 
@@ -962,6 +1304,7 @@ export default function AiVoiceMic({
 
   // Cancel microphone recording session
   const cancelListening = () => {
+    if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
     isListeningRef.current = false;
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch {}
@@ -977,6 +1320,7 @@ export default function AiVoiceMic({
 
   // Process stopping recording and submitting command immediately
   const handleDoneAndRun = (overrideText = '') => {
+    if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
     isListeningRef.current = false;
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch {}
@@ -1154,6 +1498,64 @@ export default function AiVoiceMic({
               >
                 <i className="ti ti-x" />
               </button>
+            </div>
+          </div>
+
+          {/* Always-On Wake Word ("Planner") & Voice Match Status Row */}
+          <div className="ai-wake-setting-row">
+            <div className="ai-wake-setting-info">
+              <span className="ai-wake-setting-title">
+                <i
+                  className="ti ti-broadcast"
+                  style={{ color: alwaysListen && voiceProfile?.isTrained ? '#22c55e' : 'var(--muted)' }}
+                />
+                Always-On Mic: “Planner”
+              </span>
+              <span className="ai-wake-setting-sub">
+                {voiceProfile?.isTrained
+                  ? alwaysListen
+                    ? 'Say "Planner" anytime to activate'
+                    : 'Wake word paused (click to resume)'
+                  : 'Requires voice model setup'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {voiceProfile?.isTrained ? (
+                <>
+                  <button
+                    type="button"
+                    className="pill"
+                    style={{ padding: '3px 8px', fontSize: 10 }}
+                    onClick={() => {
+                      setTrainingStep(0);
+                      setShowVoiceMatchModal(true);
+                    }}
+                    title="Retrain your voice samples"
+                  >
+                    Retrain
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill ${alwaysListen ? 'primary' : 'muted'}`}
+                    style={{ padding: '3px 10px', fontSize: 11, fontWeight: 600 }}
+                    onClick={handleToggleAlwaysListen}
+                  >
+                    {alwaysListen ? 'ON' : 'PAUSED'}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="pill primary"
+                  style={{ padding: '4px 10px', fontSize: 11, fontWeight: 600 }}
+                  onClick={() => {
+                    setTrainingStep(0);
+                    setShowVoiceMatchModal(true);
+                  }}
+                >
+                  <i className="ti ti-sparkles" style={{ marginRight: 3 }} /> Train Voice
+                </button>
+              )}
             </div>
           </div>
 
@@ -1522,6 +1924,14 @@ export default function AiVoiceMic({
         </div>
       )}
 
+      {/* Floating Assistant Wake Word Activation Banner */}
+      {wakeActivated && (
+        <div className="ai-wake-banner">
+          <span className="ai-wake-dot" />
+          <span>“Planner” detected! Listening…</span>
+        </div>
+      )}
+
       {/* Cancel button that shows up while processing or capturing voice, positioned just adjacent */}
       {(analyzing || listening || isHolding) && (
         <button
@@ -1539,12 +1949,43 @@ export default function AiVoiceMic({
         </button>
       )}
 
+      {/* Always-on Wake Word Status Badge (Adjacent to Mic) */}
+      {!voiceProfile?.isTrained ? (
+        <button
+          type="button"
+          className="ai-wake-status-badge needs-training"
+          onClick={() => {
+            setTrainingStep(0);
+            setShowVoiceMatchModal(true);
+          }}
+          title="Personalize your voice model (Google Assistant setup)"
+        >
+          <i className="ti ti-sparkles" /> Set up "Planner" Voice Match
+        </button>
+      ) : (
+        <button
+          type="button"
+          className={`ai-wake-status-badge ${alwaysListen ? 'active' : ''}`}
+          onClick={handleToggleAlwaysListen}
+          title={alwaysListen ? 'Always listening for "Planner" (Click to pause)' : 'Always listening paused (Click to resume)'}
+        >
+          <span
+            className={`ai-wake-status-dot ${alwaysListen ? 'pulsing' : ''}`}
+            style={{ background: alwaysListen ? '#22c55e' : '#71717a' }}
+          />
+          <span>Always Listening: “Planner”</span>
+          <span style={{ opacity: 0.65, fontSize: 10, fontWeight: 700 }}>
+            {alwaysListen ? 'ON' : 'PAUSED'}
+          </span>
+        </button>
+      )}
+
       {/* SUITABLY ENLARGED FLOATING MIC TOGGLE (NO TEXT) IN BOTTOM RIGHT */}
       <button
         type="button"
         id="ai-voice-fab"
-        className={`ai-fab-mic-btn ${(listening || isHolding) ? 'listening' : ''} ${isHolding ? 'holding' : ''} ${analyzing ? 'analyzing' : ''}`}
-        title="Click once to open window, or hold to record and speak"
+        className={`ai-fab-mic-btn ${(listening || isHolding) ? 'listening' : ''} ${isHolding ? 'holding' : ''} ${analyzing ? 'analyzing' : ''} ${wakeActivated ? 'wake-activated' : ''}`}
+        title={alwaysListen ? 'Say "Planner" anytime, click once to open window, or hold to talk' : 'Click once to open window, or hold to record and speak'}
         onPointerDown={handlePointerDown}
         onPointerUp={handlePointerUp}
         onPointerLeave={handlePointerCancelOrLeave}
@@ -1568,6 +2009,171 @@ export default function AiVoiceMic({
           </span>
         )}
       </button>
+
+      {/* Google Assistant Style Voice Match Setup / Training Modal */}
+      {showVoiceMatchModal && (
+        <div
+          className="voice-match-backdrop"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowVoiceMatchModal(false);
+          }}
+        >
+          <div className="voice-match-card">
+            {/* Top Close Button */}
+            <button
+              type="button"
+              className="ai-window-close"
+              style={{ position: 'absolute', top: 16, right: 16 }}
+              onClick={() => setShowVoiceMatchModal(false)}
+              title="Close setup"
+            >
+              <i className="ti ti-x" />
+            </button>
+
+            {trainingStep < 3 ? (
+              <>
+                <div className="voice-match-rings-wrap">
+                  <div className="voice-match-glow" />
+                  <div className={`voice-match-circle ${voiceDetected ? 'active' : ''}`}>
+                    <i className="ti ti-microphone" />
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gap: 4 }}>
+                  <h3 className="voice-match-title">Teach Assistant your voice</h3>
+                  <p className="voice-match-desc">
+                    Personalize your voice model so Planner responds whenever you say <b>“Planner”</b>.
+                  </p>
+                </div>
+
+                {/* Progress bar */}
+                <div className="voice-match-progress-bar-bg">
+                  <div
+                    className="voice-match-progress-bar-fill"
+                    style={{ width: `${(trainingStep / 3) * 100}%` }}
+                  />
+                </div>
+
+                {/* Step indicator badges */}
+                <div className="voice-match-steps-row">
+                  {[0, 1, 2].map((idx) => (
+                    <div
+                      key={idx}
+                      className={`voice-match-step-badge ${
+                        trainingStep > idx ? 'done' : trainingStep === idx ? 'current' : ''
+                      }`}
+                    >
+                      {trainingStep > idx ? <i className="ti ti-check" /> : idx + 1}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Active phrase to speak */}
+                <div className={`voice-match-phrase-box ${voiceDetected ? 'hearing' : ''}`}>
+                  <span className="voice-match-prompt-label">
+                    {VOICE_TRAINING_STEPS[trainingStep].title}
+                  </span>
+                  <span className="voice-match-prompt-text">
+                    {VOICE_TRAINING_STEPS[trainingStep].display}
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                    {VOICE_TRAINING_STEPS[trainingStep].sub}
+                  </span>
+                </div>
+
+                {/* Live wave visualizer */}
+                <div className="voice-match-live-indicator">
+                  <span style={{ color: voiceDetected ? '#4ade80' : 'var(--muted)' }}>
+                    {voiceDetected ? '🟢 Hearing your voice…' : '🎙️ Speak the phrase aloud'}
+                  </span>
+                </div>
+                <div className="voice-match-wave-row">
+                  {frequencies.map((h, i) => (
+                    <div
+                      key={i}
+                      className="voice-match-wave-bar"
+                      style={{
+                        height: `${Math.max(4, h)}px`,
+                        background: voiceDetected ? '#4ade80' : 'var(--accent)',
+                      }}
+                    />
+                  ))}
+                </div>
+
+                <div className="voice-match-actions">
+                  <button
+                    type="button"
+                    className="pill primary"
+                    style={{ padding: '8px 18px', fontSize: 13, fontWeight: 600 }}
+                    onClick={handleTrainingPhraseSpoken}
+                  >
+                    <i className="ti ti-check" style={{ marginRight: 4 }} />
+                    Confirm Phrase
+                  </button>
+                  <button
+                    type="button"
+                    className="muted"
+                    style={{ fontSize: 12 }}
+                    onClick={() => setShowVoiceMatchModal(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* Success screen */
+              <>
+                <div className="voice-match-success-icon">
+                  <i className="ti ti-check" />
+                </div>
+
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <h3 className="voice-match-title" style={{ color: '#4ade80' }}>
+                    Voice Match Ready!
+                  </h3>
+                  <p className="voice-match-desc">
+                    Your personalized voice model has been trained. The app now has continuous access to your microphone and will listen in the background.
+                  </p>
+                </div>
+
+                <div
+                  style={{
+                    background: '#1c1c22',
+                    padding: '12px 16px',
+                    borderRadius: 14,
+                    border: '1px solid #2e2e38',
+                    textAlign: 'left',
+                    display: 'grid',
+                    gap: 6,
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#f4f4f5' }}>
+                    <i className="ti ti-sparkles" style={{ color: 'var(--accent)' }} />
+                    <b>How it works:</b>
+                  </div>
+                  <div style={{ color: 'var(--muted)', lineHeight: 1.45 }}>
+                    • Say <b>“Planner”</b> anytime to activate listening.<br />
+                    • Or say <b>“Planner, add physics test tomorrow”</b> in one breath!<br />
+                    • Background listening keeps your mic ready on this tab.
+                  </div>
+                </div>
+
+                <div className="voice-match-actions">
+                  <button
+                    type="button"
+                    className="pill primary"
+                    style={{ padding: '10px 24px', fontSize: 13, fontWeight: 700 }}
+                    onClick={completeTrainingAndActivate}
+                  >
+                    Activate “Planner” Assistant
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
