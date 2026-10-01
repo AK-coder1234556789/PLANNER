@@ -607,6 +607,17 @@ function ruleBasedParseCommand(speechText: string, currentDate: string, existing
 app.post('/api/transcribe-audio', requireUser, transcribeAudio);
 app.post('/api/parse-voice-command', requireUser, parseVoiceCommand);
 
+// Direct download endpoint for full project ZIP
+app.get(['/api/download-zip', '/jee-planner-latest.zip'], (_req, res) => {
+  const zipPath = path.resolve(__dirname, 'jee-planner-latest.zip');
+  if (fs.existsSync(zipPath)) {
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="jee-planner-latest.zip"');
+    return res.sendFile(zipPath);
+  }
+  return res.status(404).send('ZIP file not found');
+});
+
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
