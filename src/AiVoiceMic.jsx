@@ -451,6 +451,19 @@ export default function AiVoiceMic({
   const [hudTab, setHudTab] = useState('assistant'); // 'assistant' | 'wake_settings'
   const [showWakeMenu, setShowWakeMenu] = useState(true);
   const [trainingLiveText, setTrainingLiveText] = useState('');
+  const [micPermission, setMicPermission] = useState('prompt'); // 'prompt' | 'granted' | 'denied'
+
+  // Query browser mic permission status on load
+  useEffect(() => {
+    if (navigator.permissions?.query) {
+      navigator.permissions.query({ name: 'microphone' }).then((status) => {
+        setMicPermission(status.state);
+        status.onchange = () => {
+          setMicPermission(status.state);
+        };
+      }).catch(() => {});
+    }
+  }, []);
 
   const [voiceProfile, setVoiceProfile] = useState(() => {
     try {
@@ -795,9 +808,9 @@ export default function AiVoiceMic({
   };
 
   // Direct Audio Recorder using browser microphone
-  const startMediaRecorder = async () => {
+  const startMediaRecorder = async (existingStream = null) => {
     try {
-      const stream = await getAudioStream();
+      const stream = existingStream || (await getAudioStream());
       recordedSamplesRef.current = [];
       audioChunksRef.current = [];
       isListeningRef.current = true;
@@ -953,8 +966,8 @@ export default function AiVoiceMic({
 
   // Background Always-On Microphone Wake Word Supervisor
   useEffect(() => {
-    // Background listener runs when alwaysListen is enabled, no foreground session is busy
-    if (!alwaysListen || listening || isHolding || analyzing || isTestingMic || showVoiceMatchModal) {
+    // Background listener runs ONLY when mic is granted, alwaysListen is enabled, and no foreground session is busy
+    if (!alwaysListen || micPermission !== 'granted' || listening || isHolding || analyzing || isTestingMic || showVoiceMatchModal) {
       if (backgroundRecognitionRef.current) {
         try { backgroundRecognitionRef.current.abort(); } catch {}
         backgroundRecognitionRef.current = null;
@@ -1007,13 +1020,17 @@ export default function AiVoiceMic({
             } else {
               // Spoke only the wake word - activate active listening session
               setIsWindowOpen(true);
+              setHudTab('assistant');
               startListening();
             }
           }
         };
 
         bgRec.onerror = (e) => {
-          if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          if (e.error === 'not-allowed') {
+            setMicPermission('denied');
+            isBackgroundListeningRef.current = false;
+          } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
             console.warn('[Wake Word Background notice]', e.error);
           }
         };
@@ -1045,7 +1062,7 @@ export default function AiVoiceMic({
         backgroundRecognitionRef.current = null;
       }
     };
-  }, [alwaysListen, wakeWord, wakeSensitivity, listening, isHolding, analyzing, isTestingMic, showVoiceMatchModal]);
+  }, [alwaysListen, micPermission, wakeWord, wakeSensitivity, listening, isHolding, analyzing, isTestingMic, showVoiceMatchModal]);
 
   // Voice Match Training Speech Listener (when setup wizard is open)
   useEffect(() => {
@@ -1393,15 +1410,87 @@ export default function AiVoiceMic({
     setManualCmd('');
     if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
 
-    startMediaRecorder();
+    setIsWindowOpen(true);
 
+    // Stop background listener so it doesn't collide with foreground recognition
+    if (backgroundRecognitionRef.current) {
+      try { backgroundRecognitionRef.current.abort(); } catch {}
+      backgroundRecognitionRef.current = null;
+    }
+    isBackgroundListeningRef.current = false;
+
+    // Stop any existing foreground recognizer before starting
     if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch {}
+    }
+
+    let stream = null;
+    try {
+      stream = await getAudioStream();
+      setMicPermission('granted');
+      startAudioVisualizer(stream);
+      await startMediaRecorder(stream);
+    } catch (err) {
+      console.warn('Microphone permission error:', err);
+      setMicPermission('denied');
+      setError('Microphone access blocked. Please allow microphone permission in your browser URL bar.');
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
       try {
-        recognitionRef.current.start();
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = navigator.language || 'en-US';
+
+        recognition.onstart = () => {
+          setListening(true);
+          setError('');
+        };
+
+        recognition.onresult = (event) => {
+          let full = '';
+          for (let i = 0; i < event.results.length; i++) {
+            full += event.results[i][0].transcript + ' ';
+          }
+          const text = full.trim();
+          if (text) {
+            setTranscript(text);
+            setManualCmd(text);
+
+            if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
+            speechSilenceTimerRef.current = setTimeout(() => {
+              if (isListeningRef.current) {
+                handleDoneAndRun(text);
+              }
+            }, 1800);
+          }
+        };
+
+        recognition.onerror = (event) => {
+          console.warn('SpeechRecognition notice:', event.error);
+          if (event.error === 'not-allowed') {
+            setMicPermission('denied');
+            setError('Microphone access blocked. Click lock icon in browser URL bar to allow.');
+          }
+        };
+
+        recognition.onend = () => {
+          if (isListeningRef.current) {
+            try { recognition.start(); } catch {}
+          }
+        };
+
+        recognition.start();
+        recognitionRef.current = recognition;
       } catch (err) {
-        console.warn('SpeechRecognition parallel start notice:', err);
+        console.warn('SpeechRecognition start notice:', err);
       }
     }
+
+    setListening(true);
   };
 
   // Cancel microphone recording session
@@ -1452,57 +1541,24 @@ export default function AiVoiceMic({
     executeVoiceCommand(cmd, finalWavBlob);
   };
 
-  // Single Click opens window; Holding records audio and acts on release [SILENTLY]
-  const handlePointerDown = (e) => {
-    if (e.button !== undefined && e.button !== 0) return;
-    pointerDownTimeRef.current = Date.now();
-    isHoldingActiveRef.current = false;
+  // Direct Click Handler on the floating mic toggle
+  const handleFabClick = async (e) => {
+    e?.preventDefault();
+    e?.stopPropagation();
 
-    if (holdTimerRef.current) {
-      clearTimeout(holdTimerRef.current);
-    }
+    if (analyzing) return;
 
-    // Pressing for > 200ms begins HOLD-TO-TALK recording
-    holdTimerRef.current = setTimeout(() => {
-      isHoldingActiveRef.current = true;
-      setIsHolding(true);
-      startListening();
-    }, 200);
-  };
-
-  const handlePointerUp = (e) => {
-    if (holdTimerRef.current) {
-      clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = null;
-    }
-
-    const duration = Date.now() - pointerDownTimeRef.current;
-
-    // Single click (< 200ms): Toggle open/close the window
-    if (!isHoldingActiveRef.current && duration < 200) {
-      setIsWindowOpen((prev) => !prev);
+    // If already listening, clicking stops and executes immediately
+    if (listening) {
+      handleDoneAndRun();
       return;
     }
 
-    // Was holding: Release to act [SILENTLY]
-    if (isHoldingActiveRef.current) {
-      isHoldingActiveRef.current = false;
-      setIsHolding(false);
-      handleDoneAndRun();
-    }
-  };
-
-  const handlePointerCancelOrLeave = (e) => {
-    if (holdTimerRef.current) {
-      clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = null;
-    }
-
-    if (isHoldingActiveRef.current) {
-      isHoldingActiveRef.current = false;
-      setIsHolding(false);
-      handleDoneAndRun();
-    }
+    // Open HUD, switch to assistant view, play chime, and start listening
+    setIsWindowOpen(true);
+    setHudTab('assistant');
+    playAssistantChime();
+    await startListening();
   };
 
   // Dedicated Cancel handler to stop voice recording, discard audio, or abort in-flight AI processing
@@ -1803,6 +1859,38 @@ export default function AiVoiceMic({
                     <i className="ti ti-adjustments-horizontal" style={{ marginRight: 3 }} /> Wake Word Settings
                   </button>
                 </div>
+              </div>
+
+              {/* Google Assistant 4-Color Wave Indicator */}
+              <div className="google-assistant-wave">
+                <div className="ga-dots-group">
+                  <span className="ga-dot blue" />
+                  <span className="ga-dot red" />
+                  <span className="ga-dot yellow" />
+                  <span className="ga-dot green" />
+                </div>
+                <span className="ga-text">
+                  {transcript ? `“${transcript}”` : listening ? 'Google Assistant listening… speak your command now' : 'Ready to listen. Click Speak or Mic'}
+                </span>
+                {listening ? (
+                  <button
+                    type="button"
+                    className="pill primary"
+                    style={{ padding: '3px 10px', fontSize: 11, fontWeight: 700 }}
+                    onClick={() => handleDoneAndRun()}
+                  >
+                    Done
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="pill"
+                    style={{ padding: '3px 10px', fontSize: 11, fontWeight: 600 }}
+                    onClick={() => startListening()}
+                  >
+                    <i className="ti ti-microphone" style={{ marginRight: 3 }} /> Speak
+                  </button>
+                )}
               </div>
 
           {/* Microphone Device Selection */}
@@ -2197,20 +2285,43 @@ export default function AiVoiceMic({
         </button>
       )}
 
-      {/* Always-on Wake Word Status Badge (Adjacent to Mic) */}
+      {/* Always-on Wake Word / Mic Status Badge */}
       <button
         type="button"
-        className={`ai-wake-status-badge ${alwaysListen ? 'active' : ''}`}
-        onClick={handleToggleAlwaysListen}
-        title={alwaysListen ? `Listening for "${wakeWord}" (Click to pause)` : 'Always listening paused (Click to resume)'}
+        className={`ai-wake-status-badge ${alwaysListen && micPermission === 'granted' ? 'active' : ''}`}
+        onClick={async () => {
+          if (micPermission !== 'granted') {
+            try {
+              const stream = await getAudioStream();
+              setMicPermission('granted');
+              startAudioVisualizer(stream);
+              setFeedback({ message: 'Microphone enabled!' });
+              startListening();
+            } catch (err) {
+              setMicPermission('denied');
+              setError('Microphone access blocked. Please allow mic in browser URL bar.');
+            }
+            return;
+          }
+          handleToggleAlwaysListen();
+        }}
+        title={
+          micPermission !== 'granted'
+            ? 'Click to enable microphone access'
+            : alwaysListen
+            ? `Listening for "${wakeWord}" (Click to pause)`
+            : 'Always listening paused (Click to resume)'
+        }
       >
         <span
-          className={`ai-wake-status-dot ${alwaysListen ? 'pulsing' : ''}`}
-          style={{ background: alwaysListen ? '#22c55e' : '#71717a' }}
+          className={`ai-wake-status-dot ${alwaysListen && micPermission === 'granted' ? 'pulsing' : ''}`}
+          style={{ background: micPermission !== 'granted' ? '#f59e0b' : alwaysListen ? '#22c55e' : '#71717a' }}
         />
-        <span>Listening: “{wakeWord}”</span>
-        <span style={{ opacity: 0.65, fontSize: 10, fontWeight: 700 }}>
-          {alwaysListen ? 'ON' : 'PAUSED'}
+        <span>
+          {micPermission !== 'granted' ? 'Click to Enable Mic' : `Listening: “${wakeWord}”`}
+        </span>
+        <span style={{ opacity: 0.7, fontSize: 10, fontWeight: 700 }}>
+          {micPermission !== 'granted' ? 'ALLOW' : alwaysListen ? 'ON' : 'PAUSED'}
         </span>
       </button>
 
@@ -2218,12 +2329,9 @@ export default function AiVoiceMic({
       <button
         type="button"
         id="ai-voice-fab"
-        className={`ai-fab-mic-btn ${(listening || isHolding) ? 'listening' : ''} ${isHolding ? 'holding' : ''} ${analyzing ? 'analyzing' : ''} ${wakeActivated ? 'wake-activated' : ''}`}
-        title={alwaysListen ? `Say "${wakeWord}" anytime, click once to open window, or hold to talk` : 'Click once to open window, or hold to record and speak'}
-        onPointerDown={handlePointerDown}
-        onPointerUp={handlePointerUp}
-        onPointerLeave={handlePointerCancelOrLeave}
-        onPointerCancel={handlePointerCancelOrLeave}
+        className={`ai-fab-mic-btn ${listening ? 'listening' : ''} ${analyzing ? 'analyzing' : ''} ${wakeActivated ? 'wake-activated' : ''}`}
+        title={listening ? 'Listening… click to finish and act' : `Click to speak to Google Assistant or say "${wakeWord}"`}
+        onClick={handleFabClick}
         onContextMenu={(e) => e.preventDefault()}
         disabled={analyzing}
         aria-label="Voice Controller"
@@ -2236,7 +2344,7 @@ export default function AiVoiceMic({
           )}
         </div>
 
-        {(listening || isHolding) && (
+        {listening && (
           <span className="ai-fab-ripples">
             <span className="ai-ripple-1" />
             <span className="ai-ripple-2" />
