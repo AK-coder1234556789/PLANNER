@@ -1,0 +1,2441 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { auth } from './firebase';
+
+// Sends the signed-in user's Firebase token so the server can verify who is calling
+async function authHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  try {
+    const t = await auth?.currentUser?.getIdToken();
+    if (t) h.Authorization = 'Bearer ' + t;
+  } catch {}
+  return h;
+}
+
+// SILENT AI: Speech synthesis completely disabled per user request
+function speakFeedback() {
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {}
+  }
+}
+
+// Synthesized pleasant two-tone Google Assistant / Gemini style chime
+function playAssistantChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    
+    // Note 1: D5 (587.33 Hz)
+    const osc1 = ctx.createOscillator();
+    const gain1 = ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(587.33, now);
+    gain1.gain.setValueAtTime(0, now);
+    gain1.gain.linearRampToValueAtTime(0.14, now + 0.02);
+    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+    osc1.connect(gain1);
+    gain1.connect(ctx.destination);
+    osc1.start(now);
+    osc1.stop(now + 0.12);
+    
+    // Note 2: A5 (880.00 Hz)
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(880.00, now + 0.08);
+    gain2.gain.setValueAtTime(0, now + 0.08);
+    gain2.gain.linearRampToValueAtTime(0.18, now + 0.10);
+    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.30);
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.start(now + 0.08);
+    osc2.stop(now + 0.30);
+  } catch (e) {
+    console.warn('Could not play assistant chime:', e);
+  }
+}
+
+// Success chime for Voice Match training steps
+function playSuccessChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(523.25, now); // C5
+    osc.frequency.exponentialRampToValueAtTime(1046.5, now + 0.15); // C6
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.12, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.22);
+  } catch {}
+}
+
+function getVoiceTrainingSteps(word = 'Planner') {
+  const w = (word || 'Planner').trim();
+  return [
+    {
+      step: 1,
+      title: `Say: "${w}"`,
+      sub: 'Speak clearly into your microphone to record your natural voice',
+      expectedPhrase: w.toLowerCase(),
+      display: `“${w}”`,
+    },
+    {
+      step: 2,
+      title: `Say: "Hey ${w}"`,
+      sub: 'Speak in your natural speaking pace',
+      expectedPhrase: w.toLowerCase(),
+      display: `“Hey ${w}”`,
+    },
+    {
+      step: 3,
+      title: `Say: "${w}, add a task"`,
+      sub: 'Teaches your assistant to recognize your commands seamlessly',
+      expectedPhrase: w.toLowerCase(),
+      display: `“${w}, add a task”`,
+    },
+  ];
+}
+
+// Matches custom wake word with smart fuzzy and accent tolerance
+function isWakeWordDetected(phrase, targetWord = 'Planner', sensitivity = 'high') {
+  if (!phrase) return false;
+  const pLower = phrase.toLowerCase().trim();
+  const tLower = (targetWord || 'Planner').toLowerCase().trim();
+  if (!tLower) return false;
+
+  // 1. Exact or boundary match (e.g. "planner", "hey planner", "ok planner")
+  const escaped = tLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const reg = new RegExp(`(?:^|\\b)(?:hey\\s+|ok\\s+|hi\\s+)?${escaped}\\b`, 'i');
+  if (reg.test(pLower)) return true;
+
+  // 2. Phrase contains target word
+  if (pLower.includes(tLower)) return true;
+
+  // 3. Smart / Relaxed sensitivity (catches speech accents or slight engine variations)
+  if (sensitivity === 'high') {
+    if (tLower === 'planner') {
+      if (/\b(?:planer|plana|plan|plannar|plannr|planners|planner's|pleaner)\b/i.test(pLower)) return true;
+    }
+    const parts = tLower.split(/\s+/).filter(Boolean);
+    if (parts.length > 1 && parts.every((p) => pLower.includes(p))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Extract command trailing the custom wake word
+function extractTrailingCommand(phrase, targetWord = 'Planner') {
+  if (!phrase) return '';
+  const tLower = (targetWord || 'Planner').toLowerCase().trim();
+  const escaped = tLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const reg = new RegExp(`^.*?\\b(?:hey\\s+|ok\\s+|hi\\s+)?(?:${escaped}|planner|planer|plan)[\\s,:]*`, 'i');
+  return phrase.replace(reg, '').trim();
+}
+
+// Client-side rule-based command engine (guaranteed zero-downtime fallback)
+function clientParseVoiceCommand(speechText, currentDate, labels = []) {
+  const textLower = speechText.toLowerCase().trim();
+  const today = currentDate || new Date().toISOString().slice(0, 10);
+  const labelNames = labels.map((l) => (typeof l === 'string' ? l : l.name));
+
+  // 0. Undo & Redo Actions
+  if (textLower === 'undo' || textLower === 'undo that' || textLower === 'undo action' || textLower === 'revert' || textLower.startsWith('undo ')) {
+    return { action: 'undo', feedback: 'Undoing last action…', payload: {} };
+  }
+  if (textLower === 'redo' || textLower === 'redo that' || textLower === 'redo action' || textLower.startsWith('redo ')) {
+    return { action: 'redo', feedback: 'Redoing action…', payload: {} };
+  }
+
+  // 1. Navigation
+  if (textLower.includes('calendar') || textLower.includes('month view')) {
+    return { action: 'navigate_view', feedback: 'Switched to Calendar view', payload: { view: 'cal' } };
+  }
+  if (textLower.includes('analysis') || textLower.includes('analytics') || textLower.includes('progress') || textLower.includes('stats')) {
+    return { action: 'navigate_view', feedback: 'Switched to Analysis view', payload: { view: 'analysis' } };
+  }
+  if (textLower.includes('target') || textLower.includes('countdown') || textLower.includes('goals')) {
+    if (!textLower.startsWith('add ') && !textLower.startsWith('new ') && !textLower.startsWith('pin ') && !textLower.startsWith('delete ') && !textLower.startsWith('remove ')) {
+      return { action: 'navigate_view', feedback: 'Switched to Targets view', payload: { view: 'targets' } };
+    }
+  }
+  if (textLower.includes('day view') || textLower.includes('daily view') || textLower.includes('today view') || textLower.includes('show today') || textLower.includes('go to today') || textLower === 'today') {
+    return { action: 'navigate_view', feedback: 'Switched to Day view', payload: { view: 'day' } };
+  }
+
+  // Label navigation
+  for (const lName of labelNames) {
+    if (textLower === lName.toLowerCase() || textLower === `show ${lName.toLowerCase()}` || textLower === `go to ${lName.toLowerCase()}` || textLower === `${lName.toLowerCase()} label`) {
+      return { action: 'navigate_view', feedback: `Showing label ${lName}`, payload: { view: 'label', labelName: lName } };
+    }
+  }
+
+  // 2. Date Navigation
+  if (textLower.includes('tomorrow') && !textLower.startsWith('add') && !textLower.startsWith('new')) {
+    return { action: 'change_date', feedback: 'Navigated to Tomorrow', payload: { relativeDays: 1 } };
+  }
+  if (textLower.includes('yesterday') && !textLower.startsWith('add')) {
+    return { action: 'change_date', feedback: 'Navigated to Yesterday', payload: { relativeDays: -1 } };
+  }
+  if (textLower.includes('next day')) {
+    return { action: 'change_date', feedback: 'Navigated to Next Day', payload: { relativeDays: 1 } };
+  }
+  if (textLower.includes('previous day')) {
+    return { action: 'change_date', feedback: 'Navigated to Previous Day', payload: { relativeDays: -1 } };
+  }
+
+  // 3. Settings / Appearance
+  if (textLower.includes('wallpaper') || textLower.includes('theme') || textLower.includes('background')) {
+    for (const w of ['aurora', 'dusk', 'grid', 'dots', 'plain', 'default']) {
+      if (textLower.includes(w)) {
+        return { action: 'update_settings', feedback: `Wallpaper updated to ${w}`, payload: { wallpaper: w } };
+      }
+    }
+  }
+  if (textLower.includes('stack layout') || textLower.includes('layout stack') || textLower.includes('switch to stack')) {
+    return { action: 'update_settings', feedback: 'Layout set to Stack', payload: { layout: 'stack' } };
+  }
+  if (textLower.includes('column layout') || textLower.includes('layout columns') || textLower.includes('switch to columns') || textLower.includes('grid layout')) {
+    return { action: 'update_settings', feedback: 'Layout set to Columns', payload: { layout: 'columns' } };
+  }
+  if (textLower.includes('sidebar') || textLower.includes('toggle sidebar')) {
+    return { action: 'update_settings', feedback: 'Sidebar toggled', payload: { toggleSidebar: true } };
+  }
+  if (textLower.includes('open settings') || textLower.includes('show settings')) {
+    return { action: 'open_settings', feedback: 'Opened Settings', payload: {} };
+  }
+  if (textLower.includes('close settings')) {
+    return { action: 'close_settings', feedback: 'Closed Settings', payload: {} };
+  }
+
+  // 4. Label Removal
+  if (textLower.startsWith('delete label ') || textLower.startsWith('remove label ')) {
+    const lName = speechText.replace(/^(delete|remove)\s+label\s+/i, '').trim();
+    if (lName) {
+      return { action: 'delete_label', feedback: `Removed label "${lName}"`, payload: { labelName: lName } };
+    }
+  }
+
+  // 5. Target Management
+  if (textLower.startsWith('add target ') || textLower.startsWith('new target ')) {
+    const targetBody = speechText.replace(/^(add|new)\s+target\s+/i, '').trim();
+    let name = targetBody;
+    let deadline = today;
+    const deadlineMatch = targetBody.match(/(?:by|deadline|on)\s+([A-Za-z0-9\s,-]+)$/i);
+    if (deadlineMatch) {
+      name = targetBody.slice(0, deadlineMatch.index).trim();
+      const rawDate = deadlineMatch[1].trim();
+      if (rawDate.toLowerCase().includes('tomorrow')) {
+        const d = new Date(today + 'T00:00');
+        d.setDate(d.getDate() + 1);
+        deadline = d.toISOString().slice(0, 10);
+      } else if (rawDate.toLowerCase().includes('next week')) {
+        const d = new Date(today + 'T00:00');
+        d.setDate(d.getDate() + 7);
+        deadline = d.toISOString().slice(0, 10);
+      } else {
+        const parsed = new Date(rawDate);
+        if (!isNaN(parsed.getTime())) {
+          deadline = parsed.toISOString().slice(0, 10);
+        }
+      }
+    }
+    return { action: 'add_target', feedback: `Added target "${name}" with deadline ${deadline}`, payload: { targetName: name, deadline, note: '' } };
+  }
+  if (textLower.startsWith('pin target ')) {
+    const query = speechText.replace(/^pin\s+target\s+/i, '').trim();
+    return { action: 'pin_target', feedback: `Pinned target "${query}"`, payload: { targetQuery: query } };
+  }
+  if (textLower.startsWith('delete target ') || textLower.startsWith('remove target ')) {
+    const query = speechText.replace(/^(delete|remove)\s+target\s+/i, '').trim();
+    return { action: 'delete_target', feedback: `Deleted target "${query}"`, payload: { targetQuery: query } };
+  }
+
+  // 6. Event Management
+  if (textLower.startsWith('add event ') || textLower.startsWith('add test ') || textLower.startsWith('add revision ')) {
+    let type = 'other';
+    if (textLower.includes('test') || textLower.includes('exam')) type = 'test';
+    else if (textLower.includes('revision') || textLower.includes('revise')) type = 'revision';
+    else if (textLower.includes('deadline')) type = 'deadline';
+    let title = speechText.replace(/^add\s+(event|test|revision)\s+/i, '').trim();
+    let time = '';
+    const timeMatch = title.match(/(?:at|@)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
+    if (timeMatch) {
+      time = timeMatch[1].trim();
+      title = title.replace(timeMatch[0], '').trim();
+    }
+    return { action: 'add_event', feedback: `Added ${type} "${title}"`, payload: { title, date: today, time, eventType: type } };
+  }
+  if (textLower.startsWith('delete event ') || textLower.startsWith('remove event ')) {
+    const query = speechText.replace(/^(delete|remove)\s+event\s+/i, '').trim();
+    return { action: 'delete_event', feedback: `Deleted event "${query}"`, payload: { eventQuery: query } };
+  }
+
+  // 7. Task Complete & Delete
+  if (textLower.startsWith('mark ') && (textLower.endsWith(' done') || textLower.endsWith(' completed') || textLower.includes(' as done'))) {
+    const query = speechText.replace(/^mark\s+/i, '').replace(/\s+(as\s+)?(done|completed)$/i, '').trim();
+    return { action: 'complete_task', feedback: `Marked "${query}" as done!`, payload: { targetQuery: query } };
+  }
+  if (textLower.startsWith('delete task ') || textLower.startsWith('remove task ')) {
+    const query = speechText.replace(/^(delete|remove)\s+task\s+/i, '').trim();
+    return { action: 'delete_task', feedback: `Deleted task "${query}"`, payload: { targetQuery: query } };
+  }
+
+  // 8. Default: Add Task
+  let section = 'lectures';
+  if (textLower.includes('hw') || textLower.includes('homework') || textLower.includes('dpp') || textLower.includes('sheet') || textLower.includes('questions') || textLower.includes('exercise')) {
+    section = 'hw';
+  } else if (textLower.includes('doubt') || textLower.includes('concept') || textLower.includes('problem')) {
+    section = 'doubts';
+  }
+  let date = today;
+  if (textLower.includes('tomorrow')) {
+    const d = new Date(today + 'T00:00');
+    d.setDate(d.getDate() + 1);
+    date = d.toISOString().slice(0, 10);
+  }
+  let labelName = null;
+  for (const l of labelNames) {
+    if (textLower.includes(l.toLowerCase())) {
+      labelName = l;
+      break;
+    }
+  }
+  let cleanedText = speechText
+    .replace(/^add\s+(task\s+)?/i, '')
+    .replace(/^(to\s+)?(lectures|lecture|hw|homework|dpp|doubts|doubt)\s*[:,-]?\s*/i, '')
+    .replace(/\s+(to|in)\s+(lectures|lecture|hw|homework|dpp|doubts|doubt)$/i, '')
+    .trim();
+  if (!cleanedText) cleanedText = speechText;
+
+  const sectionName = section === 'hw' ? 'HW' : section === 'doubts' ? 'Doubts' : 'Lectures';
+  return {
+    action: 'add_task',
+    feedback: `Added "${cleanedText}" to ${sectionName}${labelName ? ' [' + labelName + ']' : ''}`,
+    payload: { section, text: cleanedText, date, labelName, type: 'task' },
+  };
+}
+
+// Downsample audio Float32 buffer and produce standard 16kHz Mono 16-bit PCM WAV
+function createWavBlobFromSamples(floatSamples, inputSampleRate = 44100, targetSampleRate = 16000) {
+  if (!floatSamples || floatSamples.length === 0) return null;
+  const ratio = inputSampleRate / targetSampleRate;
+  const newLength = Math.max(1, Math.round(floatSamples.length / ratio));
+  const downsampled = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetInput = 0;
+  while (offsetResult < downsampled.length) {
+    const nextOffsetInput = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetInput; i < nextOffsetInput && i < floatSamples.length; i++) {
+      accum += floatSamples[i];
+      count++;
+    }
+    downsampled[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetInput = nextOffsetInput;
+  }
+
+  const buffer = new ArrayBuffer(44 + downsampled.length * 2);
+  const view = new DataView(buffer);
+  // RIFF
+  view.setUint8(0, 0x52); view.setUint8(1, 0x49); view.setUint8(2, 0x46); view.setUint8(3, 0x46);
+  view.setUint32(4, 36 + downsampled.length * 2, true);
+  view.setUint8(8, 0x57); view.setUint8(9, 0x41); view.setUint8(10, 0x56); view.setUint8(11, 0x45);
+  // fmt
+  view.setUint8(12, 0x66); view.setUint8(13, 0x6d); view.setUint8(14, 0x74); view.setUint8(15, 0x20);
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, targetSampleRate, true);
+  view.setUint32(28, targetSampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  // data
+  view.setUint8(36, 0x64); view.setUint8(37, 0x61); view.setUint8(38, 0x74); view.setUint8(39, 0x61);
+  view.setUint32(40, downsampled.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < downsampled.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, downsampled[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([view], { type: 'audio/wav' });
+}
+
+export default function AiVoiceMic({
+  currentDate,
+  currentView,
+  labels,
+  canUndo = false,
+  canRedo = false,
+  onUndo,
+  onRedo,
+  onNavigateView,
+  onDateChange,
+  onAddTask,
+  onCompleteTask,
+  onDeleteTask,
+  onAddTarget,
+  onPinTarget,
+  onDeleteTarget,
+  onAddEvent,
+  onDeleteEvent,
+  onAddLabel,
+  onDeleteLabel,
+  onUpdateSettings,
+  onToggleSettingsModal,
+  onSignOut,
+}) {
+  const [listening, setListening] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [transcript, setTranscript] = useState('');
+  const [feedback, setFeedback] = useState(null);
+  const [error, setError] = useState('');
+
+  // Window toggle & Hold-to-record states
+  const [isWindowOpen, setIsWindowOpen] = useState(false);
+  const [isHolding, setIsHolding] = useState(false);
+  const holdTimerRef = useRef(null);
+  const pointerDownTimeRef = useRef(0);
+  const isHoldingActiveRef = useRef(false);
+
+  // In-flight fetch cancellation
+  const abortControllerRef = useRef(null);
+
+  const [useDirectAudio, setUseDirectAudio] = useState(false);
+  const [manualCmd, setManualCmd] = useState('');
+
+  // Audio Device Selection
+  const [audioDevices, setAudioDevices] = useState([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState(() => {
+    return localStorage.getItem('jee_selected_mic_id') || '';
+  });
+
+  // Voice Match & Always-On Wake Word States (Google Assistant Style)
+  const [wakeWord, setWakeWord] = useState(() => {
+    try {
+      return localStorage.getItem('planner_custom_wake_word') || 'Planner';
+    } catch {
+      return 'Planner';
+    }
+  });
+
+  const [customWakeInput, setCustomWakeInput] = useState(() => {
+    try {
+      return localStorage.getItem('planner_custom_wake_word') || 'Planner';
+    } catch {
+      return 'Planner';
+    }
+  });
+
+  const [wakeSensitivity, setWakeSensitivity] = useState(() => {
+    try {
+      return localStorage.getItem('planner_wake_sensitivity') || 'high';
+    } catch {
+      return 'high';
+    }
+  });
+
+  const [hudTab, setHudTab] = useState('assistant'); // 'assistant' | 'wake_settings'
+  const [showWakeMenu, setShowWakeMenu] = useState(true);
+  const [trainingLiveText, setTrainingLiveText] = useState('');
+
+  const [voiceProfile, setVoiceProfile] = useState(() => {
+    try {
+      const saved = localStorage.getItem('planner_voice_match_profile');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [alwaysListen, setAlwaysListen] = useState(() => {
+    try {
+      const saved = localStorage.getItem('planner_always_listen');
+      return saved !== null ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const [showVoiceMatchModal, setShowVoiceMatchModal] = useState(false);
+  const [trainingStep, setTrainingStep] = useState(0);
+  const [trainingVoiceSamples, setTrainingVoiceSamples] = useState([]);
+
+  // Wake Word Activation Indicator State (Google Assistant Glowing Ring)
+  const [wakeActivated, setWakeActivated] = useState(false);
+  const wakeTimeoutRef = useRef(null);
+
+  // Background speech recognition reference for always-on mic
+  const backgroundRecognitionRef = useRef(null);
+  const isBackgroundListeningRef = useRef(false);
+
+  // Silence auto-run timer (2s silence after speech runs automatically)
+  const speechSilenceTimerRef = useRef(null);
+
+  const testWakeWordActivation = () => {
+    playAssistantChime();
+    setWakeActivated(true);
+    if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
+    wakeTimeoutRef.current = setTimeout(() => setWakeActivated(false), 2800);
+    setFeedback({ message: `“${wakeWord}” detected! Listening…` });
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 2500);
+    setIsWindowOpen(true);
+    setHudTab('assistant');
+    startListening();
+  };
+
+  const saveVoiceProfile = (profileData) => {
+    try {
+      localStorage.setItem('planner_voice_match_profile', JSON.stringify(profileData));
+      localStorage.setItem('planner_always_listen', 'true');
+      setVoiceProfile(profileData);
+      setAlwaysListen(true);
+    } catch (e) {
+      console.warn('Could not save voice profile:', e);
+    }
+  };
+
+  const handleSaveWakeWord = (newWord) => {
+    const trimmed = (newWord || '').trim();
+    const finalWord = trimmed || 'Planner';
+    setWakeWord(finalWord);
+    setCustomWakeInput(finalWord);
+    localStorage.setItem('planner_custom_wake_word', finalWord);
+    setFeedback({ message: `Wake word set to: "${finalWord}"` });
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 2500);
+  };
+
+  const handleToggleAlwaysListen = () => {
+    const nextVal = !alwaysListen;
+    setAlwaysListen(nextVal);
+    localStorage.setItem('planner_always_listen', String(nextVal));
+    if (!nextVal) {
+      if (backgroundRecognitionRef.current) {
+        try { backgroundRecognitionRef.current.abort(); } catch {}
+      }
+      isBackgroundListeningRef.current = false;
+      setFeedback({ message: 'Always-on wake word paused' });
+    } else {
+      setFeedback({ message: `Always listening for "${wakeWord}" active` });
+    }
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 2500);
+  };
+
+  // Real-time microphone audio & voice reception detection
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [frequencies, setFrequencies] = useState([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+  const [voiceDetected, setVoiceDetected] = useState(false);
+  const [hasReceivedSound, setHasReceivedSound] = useState(false);
+  const [silenceDuration, setSilenceDuration] = useState(0);
+  const [isTestingMic, setIsTestingMic] = useState(false);
+
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animFrameRef = useRef(null);
+  const activeStreamRef = useRef(null);
+  const silenceCounterRef = useRef(0);
+
+  // Auto-dismiss errors after 6 seconds
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(''), 6000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
+  const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const feedbackTimerRef = useRef(null);
+
+  // Raw PCM sample accumulator from Web Audio API (captures direct headset audio)
+  const recordedSamplesRef = useRef([]);
+  const scriptProcessorRef = useRef(null);
+  const isListeningRef = useRef(false);
+  const isTranscribingRef = useRef(false);
+  const liveTranscribeTimerRef = useRef(null);
+
+  // Load and enumerate all available microphone devices
+  const loadAudioDevices = async () => {
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter((d) => d.kind === 'audioinput');
+      setAudioDevices(inputs);
+    } catch (e) {
+      console.warn('Could not enumerate audio devices:', e);
+    }
+  };
+
+  useEffect(() => {
+    loadAudioDevices();
+    if (navigator.mediaDevices?.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', loadAudioDevices);
+      return () => {
+        navigator.mediaDevices.removeEventListener('devicechange', loadAudioDevices);
+      };
+    }
+  }, []);
+
+  // Helper to obtain audio media stream using selected mic device
+  const getAudioStream = async (deviceIdOverride) => {
+    const targetDevId = deviceIdOverride !== undefined ? deviceIdOverride : selectedDeviceId;
+    const constraints = {
+      audio: targetDevId
+        ? {
+            deviceId: { exact: targetDevId },
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        : {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+    };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    loadAudioDevices();
+    return stream;
+  };
+
+  // Change microphone input
+  const handleDeviceChange = async (newDeviceId) => {
+    setSelectedDeviceId(newDeviceId);
+    localStorage.setItem('jee_selected_mic_id', newDeviceId);
+
+    if (isTestingMic || listening) {
+      try {
+        const stream = await getAudioStream(newDeviceId);
+        startAudioVisualizer(stream);
+      } catch (err) {
+        console.warn('Switch mic error:', err);
+      }
+    }
+  };
+
+  // Active live headset audio transcriber (sends captured audio snippets to Gemini for live text display)
+  const triggerLiveTranscribe = () => {
+    if (liveTranscribeTimerRef.current) return;
+    liveTranscribeTimerRef.current = setTimeout(async () => {
+      liveTranscribeTimerRef.current = null;
+      if (isTranscribingRef.current || recordedSamplesRef.current.length < 8) return;
+      isTranscribingRef.current = true;
+      try {
+        let totalLength = 0;
+        for (const arr of recordedSamplesRef.current) totalLength += arr.length;
+        const merged = new Float32Array(totalLength);
+        let offset = 0;
+        for (const arr of recordedSamplesRef.current) {
+          merged.set(arr, offset);
+          offset += arr.length;
+        }
+
+        const audioCtx = audioContextRef.current;
+        const wavBlob = createWavBlobFromSamples(merged, audioCtx?.sampleRate || 44100, 16000);
+        if (!wavBlob || wavBlob.size < 1200) return;
+
+        const reader = new FileReader();
+        const base64Promise = new Promise((resolve) => {
+          reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
+        });
+        reader.readAsDataURL(wavBlob);
+        const b64 = await base64Promise;
+        if (!b64) return;
+
+        const res = await fetch('/api/transcribe-audio', {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: JSON.stringify({ audioBase64: b64, mimeType: 'audio/wav' }),
+        });
+
+        if (res.ok) {
+          const resData = await res.json();
+          if (resData.success && resData.transcript) {
+            console.log('[Live Transcribe] Actively written text:', resData.transcript);
+            setTranscript(resData.transcript);
+            setManualCmd(resData.transcript);
+          }
+        }
+      } catch (err) {
+        console.warn('Live transcribe check notice:', err);
+      } finally {
+        isTranscribingRef.current = false;
+      }
+    }, 1100);
+  };
+
+  // Real-time audio analyzer using Web Audio API + PCM sample capture
+  const startAudioVisualizer = (stream) => {
+    try {
+      stopAudioVisualizer();
+      activeStreamRef.current = stream;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+
+      const audioCtx = new AudioCtx();
+      audioContextRef.current = audioCtx;
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      analyserRef.current = analyser;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      // ScriptProcessorNode to capture raw Float32 audio samples from the headset
+      try {
+        const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+        scriptProcessorRef.current = scriptNode;
+        scriptNode.onaudioprocess = (e) => {
+          if (!isListeningRef.current) return;
+          const input = e.inputBuffer.getChannelData(0);
+          recordedSamplesRef.current.push(new Float32Array(input));
+          // If vocal audio is being received, trigger live active transcription
+          if (silenceCounterRef.current < 20) {
+            triggerLiveTranscribe();
+          }
+        };
+        source.connect(scriptNode);
+        scriptNode.connect(audioCtx.destination);
+      } catch (scriptErr) {
+        console.warn('ScriptProcessor setup note:', scriptErr);
+      }
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      silenceCounterRef.current = 0;
+      setSilenceDuration(0);
+      setHasReceivedSound(false);
+
+      const updateMeter = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+
+        let sum = 0;
+        const bars = [];
+        const step = Math.max(1, Math.floor(bufferLength / 12));
+        for (let i = 0; i < 12; i++) {
+          const val = dataArray[i * step] || 0;
+          bars.push(Math.round((val / 255) * 22) + 2);
+          sum += val;
+        }
+        setFrequencies(bars);
+
+        const avg = sum / bufferLength;
+        const level = Math.min(100, Math.round((avg / 128) * 100));
+        setAudioLevel(level);
+
+        if (level > 4) {
+          setVoiceDetected(true);
+          setHasReceivedSound(true);
+          silenceCounterRef.current = 0;
+          setSilenceDuration(0);
+        } else {
+          setVoiceDetected(false);
+          silenceCounterRef.current += 1;
+          if (silenceCounterRef.current % 30 === 0) {
+            setSilenceDuration((prev) => prev + 0.5);
+          }
+        }
+
+        animFrameRef.current = requestAnimationFrame(updateMeter);
+      };
+
+      animFrameRef.current = requestAnimationFrame(updateMeter);
+    } catch (e) {
+      console.warn('Audio visualizer error:', e);
+    }
+  };
+
+  const stopAudioVisualizer = () => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect();
+      } catch {}
+      scriptProcessorRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch {}
+      audioContextRef.current = null;
+    }
+    if (activeStreamRef.current) {
+      activeStreamRef.current.getTracks().forEach((track) => track.stop());
+      activeStreamRef.current = null;
+    }
+    setAudioLevel(0);
+    setVoiceDetected(false);
+    setFrequencies([3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+  };
+
+  // Direct Audio Recorder using browser microphone
+  const startMediaRecorder = async () => {
+    try {
+      const stream = await getAudioStream();
+      recordedSamplesRef.current = [];
+      audioChunksRef.current = [];
+      isListeningRef.current = true;
+      startAudioVisualizer(stream);
+
+      // Pick best supported MIME type
+      let mimeType = 'audio/webm';
+      if (typeof MediaRecorder.isTypeSupported === 'function') {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        }
+      }
+
+      try {
+        const mediaRecorder = new MediaRecorder(stream, { mimeType });
+        mediaRecorderRef.current = mediaRecorder;
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+        mediaRecorder.start(800);
+      } catch (mrErr) {
+        console.warn('MediaRecorder init note:', mrErr);
+      }
+
+      setListening(true);
+      setError('');
+      setUseDirectAudio(true);
+    } catch (err) {
+      console.error('Audio recorder error:', err);
+      stopAudioVisualizer();
+      setError('Microphone permission required. Please allow microphone access or select mic.');
+      setListening(false);
+    }
+  };
+
+  // Dedicated Microphone Input Check / Test
+  const toggleTestMic = async () => {
+    if (isTestingMic) {
+      stopAudioVisualizer();
+      setIsTestingMic(false);
+      return;
+    }
+
+    try {
+      setError('');
+      if (listening) {
+        isListeningRef.current = false;
+        if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          try { mediaRecorderRef.current.stop(); } catch {}
+        }
+        setListening(false);
+      }
+      const stream = await getAudioStream();
+      startAudioVisualizer(stream);
+      setIsTestingMic(true);
+    } catch (err) {
+      console.error('Test mic error:', err);
+      setError('Could not access selected mic: ' + (err.message || 'Permission denied'));
+    }
+  };
+
+  // Setup Web Speech Recognition with continuous active transcription
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = navigator.language || 'en-US';
+
+      recognition.onstart = () => {
+        setError('');
+      };
+
+      recognition.onresult = (event) => {
+        let full = '';
+        for (let i = 0; i < event.results.length; i++) {
+          full += event.results[i][0].transcript + ' ';
+        }
+        const text = full.trim();
+        if (text) {
+          setTranscript(text);
+          setManualCmd(text);
+
+          // After user speaks and pauses for 1.8 seconds, command runs automatically
+          if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
+          speechSilenceTimerRef.current = setTimeout(() => {
+            if (isListeningRef.current) {
+              handleDoneAndRun(text);
+            }
+          }, 1800);
+        }
+      };
+
+      recognition.onerror = (event) => {
+        console.warn('SpeechRecognition notice:', event.error);
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          setError('Microphone access blocked. Please allow mic permissions in browser.');
+        }
+      };
+
+      recognition.onend = () => {
+        // Auto-restart if user is still listening
+        if (isListeningRef.current && recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+          } catch {}
+        }
+      };
+
+      recognitionRef.current = recognition;
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
+      }
+      stopAudioVisualizer();
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+      }
+      if (liveTranscribeTimerRef.current) {
+        clearTimeout(liveTranscribeTimerRef.current);
+      }
+      if (speechSilenceTimerRef.current) {
+        clearTimeout(speechSilenceTimerRef.current);
+      }
+    };
+  }, [selectedDeviceId]);
+
+  // Global Alt+V shortcut to start/stop listening
+  useEffect(() => {
+    const handleGlobalKeyDown = (e) => {
+      if (e.altKey && (e.key.toLowerCase() === 'v' || e.code === 'KeyV')) {
+        e.preventDefault();
+        if (listening) {
+          handleDoneAndRun();
+        } else {
+          startListening();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [listening]);
+
+  // Background Always-On Microphone Wake Word Supervisor
+  useEffect(() => {
+    // Background listener runs when alwaysListen is enabled, no foreground session is busy
+    if (!alwaysListen || listening || isHolding || analyzing || isTestingMic || showVoiceMatchModal) {
+      if (backgroundRecognitionRef.current) {
+        try { backgroundRecognitionRef.current.abort(); } catch {}
+        backgroundRecognitionRef.current = null;
+      }
+      isBackgroundListeningRef.current = false;
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    let isMounted = true;
+    isBackgroundListeningRef.current = true;
+
+    // Keep active stream alive in background so browser maintains continuous mic access
+    if (!activeStreamRef.current) {
+      getAudioStream().catch(() => {});
+    }
+
+    const startBgRecognition = () => {
+      if (!isMounted || !isBackgroundListeningRef.current || listening || analyzing || isTestingMic) return;
+      try {
+        const bgRec = new SpeechRecognition();
+        bgRec.continuous = true;
+        bgRec.interimResults = true;
+        bgRec.lang = navigator.language || 'en-US';
+
+        bgRec.onresult = (event) => {
+          let phrase = '';
+          for (let i = 0; i < event.results.length; i++) {
+            phrase += event.results[i][0].transcript + ' ';
+          }
+          const lower = phrase.toLowerCase().trim();
+
+          // Check if custom wake word or default is detected
+          if (isWakeWordDetected(lower, wakeWord, wakeSensitivity)) {
+            console.log(`[Wake Word] "${wakeWord}" detected in background:`, lower);
+            try { bgRec.abort(); } catch {}
+
+            playAssistantChime();
+            setWakeActivated(true);
+            if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
+            wakeTimeoutRef.current = setTimeout(() => setWakeActivated(false), 2800);
+
+            // Check if there is an inline command trailing the custom wake word
+            const trailingCommand = extractTrailingCommand(lower, wakeWord);
+
+            if (trailingCommand.length > 2) {
+              executeVoiceCommand(trailingCommand);
+            } else {
+              // Spoke only the wake word - activate active listening session
+              setIsWindowOpen(true);
+              startListening();
+            }
+          }
+        };
+
+        bgRec.onerror = (e) => {
+          if (e.error !== 'no-speech' && e.error !== 'aborted') {
+            console.warn('[Wake Word Background notice]', e.error);
+          }
+        };
+
+        bgRec.onend = () => {
+          if (isMounted && isBackgroundListeningRef.current && !isListeningRef.current && !analyzing && !isTestingMic) {
+            setTimeout(() => {
+              if (isMounted && isBackgroundListeningRef.current && !isListeningRef.current && !analyzing && !isTestingMic) {
+                startBgRecognition();
+              }
+            }, 300);
+          }
+        };
+
+        bgRec.start();
+        backgroundRecognitionRef.current = bgRec;
+      } catch (err) {
+        console.warn('Background wake listener start note:', err);
+      }
+    };
+
+    startBgRecognition();
+
+    return () => {
+      isMounted = false;
+      isBackgroundListeningRef.current = false;
+      if (backgroundRecognitionRef.current) {
+        try { backgroundRecognitionRef.current.abort(); } catch {}
+        backgroundRecognitionRef.current = null;
+      }
+    };
+  }, [alwaysListen, wakeWord, wakeSensitivity, listening, isHolding, analyzing, isTestingMic, showVoiceMatchModal]);
+
+  // Voice Match Training Speech Listener (when setup wizard is open)
+  useEffect(() => {
+    if (!showVoiceMatchModal || trainingStep >= 3) return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let rec = null;
+    let isCancelled = false;
+
+    // Start audio visualizer for the setup modal
+    getAudioStream().then((stream) => {
+      if (!isCancelled) startAudioVisualizer(stream);
+    }).catch(() => {});
+
+    if (SpeechRecognition) {
+      try {
+        rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = navigator.language || 'en-US';
+
+        rec.onresult = (event) => {
+          let text = '';
+          for (let i = 0; i < event.results.length; i++) {
+            text += event.results[i][0].transcript + ' ';
+          }
+          const clean = text.trim();
+          if (clean) setTrainingLiveText(clean);
+          const lower = clean.toLowerCase();
+          const target = getVoiceTrainingSteps(wakeWord)[trainingStep]?.expectedPhrase || wakeWord.toLowerCase();
+          if (
+            lower.includes(target) ||
+            lower.includes(wakeWord.toLowerCase()) ||
+            isWakeWordDetected(lower, wakeWord, 'high') ||
+            (clean.length > 2 && audioLevel > 10)
+          ) {
+            handleTrainingPhraseSpoken();
+          }
+        };
+
+        rec.start();
+      } catch (e) {
+        console.warn('Training recognizer note:', e);
+      }
+    }
+
+    return () => {
+      isCancelled = true;
+      if (rec) {
+        try { rec.abort(); } catch {}
+      }
+    };
+  }, [showVoiceMatchModal, trainingStep, wakeWord]);
+
+  const handleTrainingPhraseSpoken = () => {
+    playSuccessChime();
+    setTrainingVoiceSamples((prev) => [
+      ...prev,
+      { step: trainingStep, timestamp: Date.now(), level: audioLevel, frequencies: [...frequencies] },
+    ]);
+    setTrainingLiveText('');
+    if (trainingStep < 2) {
+      setTrainingStep((prev) => prev + 1);
+    } else {
+      setTrainingStep(3); // Complete
+    }
+  };
+
+  const completeTrainingAndActivate = () => {
+    saveVoiceProfile({
+      isTrained: true,
+      trainedAt: Date.now(),
+      samplesCount: 3,
+      samples: trainingVoiceSamples,
+      customWakeWord: wakeWord,
+    });
+    setShowVoiceMatchModal(false);
+    playAssistantChime();
+    setFeedback({ message: `Voice Match activated! Say "${wakeWord}" anytime.` });
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 3000);
+  };
+
+  // Process recognized command with ultra-fast client-first execution and Gemini AI fallback
+  const executeVoiceCommand = async (textToProcess, audioBlob = null) => {
+    const cleanText = (textToProcess || '').trim();
+    if (!cleanText && !audioBlob) return;
+    setAnalyzing(true);
+    setError('');
+
+    try {
+      let commandData = null;
+
+      // 1. ULTRA-FAST PATH: Check client-side rules FIRST (instant < 5ms execution!)
+      if (cleanText) {
+        const clientMatch = clientParseVoiceCommand(cleanText, currentDate, labels);
+        if (clientMatch && clientMatch.action && clientMatch.action !== 'feedback_only') {
+          commandData = clientMatch;
+        }
+      }
+
+      // 2. If client parser did not match (or we only have audio), call server Gemini AI parser
+      if (!commandData) {
+        let payload = {
+          currentDate: currentDate || new Date().toISOString().slice(0, 10),
+          currentView: currentView || 'day',
+          existingLabels: labels.map((l) => l.name),
+        };
+
+        if (audioBlob) {
+          const reader = new FileReader();
+          const base64Promise = new Promise((resolve) => {
+            reader.onloadend = () => resolve(reader.result?.toString().split(',')[1] || '');
+          });
+          reader.readAsDataURL(audioBlob);
+          payload.audioBase64 = await base64Promise;
+          payload.mimeType = audioBlob.type || 'audio/wav';
+        }
+        if (cleanText) {
+          payload.speechText = cleanText;
+        }
+
+        const abortCtrl = new AbortController();
+        abortControllerRef.current = abortCtrl;
+
+        try {
+          const res = await fetch('/api/parse-voice-command', {
+            method: 'POST',
+            headers: await authHeaders(),
+            body: JSON.stringify(payload),
+            signal: abortCtrl.signal,
+          });
+
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const resData = await res.json();
+            if (resData && resData.success && resData.data) {
+              commandData = resData.data;
+            }
+          }
+        } catch (fetchErr) {
+          if (fetchErr.name === 'AbortError') {
+            console.log('Voice command fetch aborted by user');
+            return;
+          }
+          console.warn('Network call to /api/parse-voice-command failed:', fetchErr);
+        } finally {
+          abortControllerRef.current = null;
+        }
+      }
+
+      if (!commandData || commandData.action === 'feedback_only') {
+        const msg = commandData?.feedback || 'Could not understand command. Please try speaking again.';
+        setFeedback({ message: msg });
+        return;
+      }
+
+      const { action, feedback: actionFeedback, payload: p } = commandData;
+
+      // Execute matched action across app features
+      switch (action) {
+        case 'navigate_view': {
+          if (p.view === 'label' && p.labelName) {
+            const matched = labels.find((l) => l.name.toLowerCase() === p.labelName.toLowerCase());
+            if (matched && onNavigateView) onNavigateView('label:' + matched.id);
+            else if (onNavigateView) onNavigateView('day');
+          } else if (onNavigateView) {
+            onNavigateView(p.view || 'day');
+          }
+          break;
+        }
+
+        case 'change_date': {
+          if (p.relativeDays !== undefined && onDateChange) {
+            const d = new Date((currentDate || new Date().toISOString().slice(0, 10)) + 'T00:00');
+            d.setDate(d.getDate() + p.relativeDays);
+            onDateChange(d.toISOString().slice(0, 10));
+          } else if (p.date && onDateChange) {
+            onDateChange(p.date);
+          }
+          if (onNavigateView && currentView !== 'day') {
+            onNavigateView('day');
+          }
+          break;
+        }
+
+        case 'add_task': {
+          if (onAddTask) {
+            await onAddTask(
+              p.section || 'lectures',
+              p.text || cleanText,
+              p.type || 'task',
+              p.date || currentDate,
+              p.labelName || null
+            );
+          }
+          break;
+        }
+
+        case 'complete_task': {
+          if (onCompleteTask) {
+            await onCompleteTask(p.targetQuery || cleanText);
+          }
+          break;
+        }
+
+        case 'delete_task': {
+          if (onDeleteTask) {
+            await onDeleteTask(p.targetQuery || cleanText);
+          }
+          break;
+        }
+
+        case 'add_target': {
+          if (onAddTarget) {
+            await onAddTarget(p.targetName, p.deadline, p.note);
+          }
+          break;
+        }
+
+        case 'pin_target': {
+          if (onPinTarget) {
+            await onPinTarget(p.targetQuery);
+          }
+          break;
+        }
+
+        case 'delete_target': {
+          if (onDeleteTarget) {
+            await onDeleteTarget(p.targetQuery);
+          }
+          break;
+        }
+
+        case 'add_event': {
+          if (onAddEvent) {
+            await onAddEvent(p.title, p.date, p.time, p.eventType);
+          }
+          break;
+        }
+
+        case 'delete_event': {
+          if (onDeleteEvent) {
+            await onDeleteEvent(p.eventQuery);
+          }
+          break;
+        }
+
+        case 'add_label': {
+          if (onAddLabel && p.labelName) {
+            await onAddLabel(p.labelName);
+          }
+          break;
+        }
+
+        case 'delete_label': {
+          if (onDeleteLabel && p.labelName) {
+            await onDeleteLabel(p.labelName);
+          }
+          break;
+        }
+
+        case 'update_settings': {
+          if (onUpdateSettings) {
+            const patch = {};
+            if (p.wallpaper) patch.wall = p.wallpaper;
+            if (p.layout) patch.layout = p.layout;
+            if (p.collapsed !== undefined) patch.collapsed = p.collapsed;
+            if (p.accent) patch.accent = p.accent;
+            if (p.toggleSidebar) patch.collapsed = '__toggle__';
+            onUpdateSettings(patch);
+          }
+          break;
+        }
+
+        case 'open_settings': {
+          if (onToggleSettingsModal) onToggleSettingsModal(true);
+          break;
+        }
+
+        case 'close_settings': {
+          if (onToggleSettingsModal) onToggleSettingsModal(false);
+          break;
+        }
+
+        case 'undo': {
+          if (onUndo) {
+            const desc = await onUndo();
+            const msg = desc ? `↩ Undone: ${desc}` : 'Nothing to undo';
+            setFeedback({ message: msg });
+            return;
+          }
+          break;
+        }
+
+        case 'redo': {
+          if (onRedo) {
+            const desc = await onRedo();
+            const msg = desc ? `↪ Redone: ${desc}` : 'Nothing to redo';
+            setFeedback({ message: msg });
+            return;
+          }
+          break;
+        }
+
+        case 'sign_out': {
+          if (onSignOut) onSignOut();
+          break;
+        }
+
+        default: {
+          if (onAddTask) {
+            await onAddTask('lectures', cleanText, 'task', currentDate, null);
+          }
+          break;
+        }
+      }
+
+      // Snappy silent visual feedback
+      const msg = actionFeedback || 'Action executed!';
+      setFeedback({ message: msg });
+      speakFeedback(); // Silent: cancels any speech
+
+      // Auto-dismiss feedback in 2.2 seconds
+      if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+      feedbackTimerRef.current = setTimeout(() => {
+        setFeedback(null);
+      }, 2200);
+
+      setTranscript('');
+      setManualCmd('');
+    } catch (err) {
+      console.error('Voice command execution failed:', err);
+      setError(err?.message || 'Could not understand command');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  // Start microphone recording session
+  const startListening = async () => {
+    setError('');
+    if (analyzing) return;
+    setTranscript('');
+    setManualCmd('');
+    if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
+
+    startMediaRecorder();
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (err) {
+        console.warn('SpeechRecognition parallel start notice:', err);
+      }
+    }
+  };
+
+  // Cancel microphone recording session
+  const cancelListening = () => {
+    if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
+    isListeningRef.current = false;
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      try { mediaRecorderRef.current.stop(); } catch {}
+    }
+    stopAudioVisualizer();
+    setListening(false);
+    setTranscript('');
+    setManualCmd('');
+  };
+
+  // Process stopping recording and submitting command immediately
+  const handleDoneAndRun = (overrideText = '') => {
+    if (speechSilenceTimerRef.current) clearTimeout(speechSilenceTimerRef.current);
+    isListeningRef.current = false;
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      try { mediaRecorderRef.current.stop(); } catch {}
+    }
+
+    // Merge Float32 samples from headset into pristine 16kHz Mono WAV
+    let finalWavBlob = null;
+    if (recordedSamplesRef.current && recordedSamplesRef.current.length > 0) {
+      let totalLength = 0;
+      for (const arr of recordedSamplesRef.current) totalLength += arr.length;
+      const merged = new Float32Array(totalLength);
+      let offset = 0;
+      for (const arr of recordedSamplesRef.current) {
+        merged.set(arr, offset);
+        offset += arr.length;
+      }
+      const audioCtx = audioContextRef.current;
+      finalWavBlob = createWavBlobFromSamples(merged, audioCtx?.sampleRate || 44100, 16000);
+    }
+
+    stopAudioVisualizer();
+    setListening(false);
+    const cmd = (overrideText || transcript || manualCmd).trim();
+    executeVoiceCommand(cmd, finalWavBlob);
+  };
+
+  // Single Click opens window; Holding records audio and acts on release [SILENTLY]
+  const handlePointerDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    pointerDownTimeRef.current = Date.now();
+    isHoldingActiveRef.current = false;
+
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+    }
+
+    // Pressing for > 200ms begins HOLD-TO-TALK recording
+    holdTimerRef.current = setTimeout(() => {
+      isHoldingActiveRef.current = true;
+      setIsHolding(true);
+      startListening();
+    }, 200);
+  };
+
+  const handlePointerUp = (e) => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+
+    const duration = Date.now() - pointerDownTimeRef.current;
+
+    // Single click (< 200ms): Toggle open/close the window
+    if (!isHoldingActiveRef.current && duration < 200) {
+      setIsWindowOpen((prev) => !prev);
+      return;
+    }
+
+    // Was holding: Release to act [SILENTLY]
+    if (isHoldingActiveRef.current) {
+      isHoldingActiveRef.current = false;
+      setIsHolding(false);
+      handleDoneAndRun();
+    }
+  };
+
+  const handlePointerCancelOrLeave = (e) => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+
+    if (isHoldingActiveRef.current) {
+      isHoldingActiveRef.current = false;
+      setIsHolding(false);
+      handleDoneAndRun();
+    }
+  };
+
+  // Dedicated Cancel handler to stop voice recording, discard audio, or abort in-flight AI processing
+  const handleCancelVoice = (e) => {
+    e?.stopPropagation();
+    e?.preventDefault();
+
+    if (abortControllerRef.current) {
+      try {
+        abortControllerRef.current.abort();
+      } catch {}
+      abortControllerRef.current = null;
+    }
+
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    isHoldingActiveRef.current = false;
+    setIsHolding(false);
+
+    cancelListening();
+    setAnalyzing(false);
+    setError('');
+    setTranscript('');
+    setManualCmd('');
+
+    setFeedback({ message: 'Voice action cancelled' });
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => {
+      setFeedback(null);
+    }, 1800);
+  };
+
+  const isWindowVisible = isWindowOpen || (listening && !isHolding);
+
+  return (
+    <div className="ai-voice-floating-container">
+      {/* Floating Hold-to-Talk Status Pill */}
+      {isHolding && (
+        <div className="ai-holding-banner">
+          <span className="ai-holding-dot" />
+          <span className="ai-holding-text">Listening... Release to Act</span>
+        </div>
+      )}
+
+      {/* Voice Controller Window popping up on Single Click */}
+      {isWindowVisible && (
+        <div className="ai-voice-live-hud">
+          {/* Window Header with Tab Switcher, Undo/Redo, Download & Close buttons */}
+          <div className="ai-window-header">
+            <div className="ai-hud-tabs">
+              <button
+                type="button"
+                className={`ai-hud-tab ${hudTab === 'assistant' ? 'active' : ''}`}
+                onClick={() => setHudTab('assistant')}
+                title="Voice Controller"
+              >
+                <i className="ti ti-microphone" />
+                <span>Voice</span>
+                {listening && <span className="ai-dot-pulse" title="Recording active" />}
+              </button>
+              <button
+                type="button"
+                className={`ai-hud-tab ${hudTab === 'wake_settings' ? 'active' : ''}`}
+                onClick={() => setHudTab('wake_settings')}
+                title="Wake Word & Voice Activation Settings"
+              >
+                <i className="ti ti-adjustments-horizontal" />
+                <span>Wake Word: “{wakeWord}”</span>
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div className="undo-redo-group" style={{ padding: '1px 3px' }}>
+                <button
+                  type="button"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11 }}
+                  disabled={!canUndo}
+                  onClick={async () => {
+                    if (onUndo) {
+                      const desc = await onUndo();
+                      setFeedback({ message: desc ? `↩ Undone: ${desc}` : 'Undone' });
+                    }
+                  }}
+                  title="Undo last action (Ctrl+Z)"
+                >
+                  <i className="ti ti-arrow-back-up" />
+                </button>
+                <button
+                  type="button"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11 }}
+                  disabled={!canRedo}
+                  onClick={async () => {
+                    if (onRedo) {
+                      const desc = await onRedo();
+                      setFeedback({ message: desc ? `↪ Redone: ${desc}` : 'Redone' });
+                    }
+                  }}
+                  title="Redo last action (Ctrl+Y)"
+                >
+                  <i className="ti ti-arrow-forward-up" />
+                </button>
+                <a
+                  href="/api/download-zip"
+                  download="jee-planner-latest.zip"
+                  className="undo-redo-btn"
+                  style={{ padding: '3px 7px', fontSize: 11, display: 'inline-flex', alignItems: 'center', textDecoration: 'none', color: 'inherit' }}
+                  title="Download complete project ZIP"
+                >
+                  <i className="ti ti-download" />
+                </a>
+              </div>
+              <button
+                type="button"
+                className="ai-window-close"
+                onClick={() => setIsWindowOpen(false)}
+                title="Close window"
+              >
+                <i className="ti ti-x" />
+              </button>
+            </div>
+          </div>
+
+          {/* TAB 1: DEDICATED WAKE WORD & VOICE ACTIVATION SETTINGS */}
+          {hudTab === 'wake_settings' ? (
+            <div className="ai-wake-settings-full">
+              <div className="ai-wake-full-hero">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div className="ai-wake-hero-icon">
+                    <i className="ti ti-broadcast" />
+                  </div>
+                  <div>
+                    <h4 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: '#f4f4f5' }}>
+                      Change Wake Word & Trigger Phrase
+                    </h4>
+                    <p style={{ margin: '2px 0 0', fontSize: 11, color: 'var(--muted)' }}>
+                      Personalize the word that wakes up your Planner hands-free.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Active Phrase Status & Mic Toggle */}
+              <div className="ai-wake-active-status-card">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: '#e4e4e7' }}>
+                    Active Wake Word:
+                  </span>
+                  <span className="ai-wake-active-pill">
+                    <span className="ai-wake-active-dot" />
+                    “{wakeWord}”
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    Always-On Background Listening:
+                  </span>
+                  <button
+                    type="button"
+                    className={`pill ${alwaysListen ? 'primary' : 'muted'}`}
+                    style={{ padding: '3px 12px', fontSize: 11, fontWeight: 700 }}
+                    onClick={handleToggleAlwaysListen}
+                  >
+                    {alwaysListen ? '🟢 ON (Listening)' : '⏸️ PAUSED'}
+                  </button>
+                </div>
+              </div>
+
+              {/* Custom Wake Word Input Form */}
+              <div className="ai-wake-form-group">
+                <label style={{ fontSize: 11, fontWeight: 700, color: '#f4f4f5', display: 'flex', justifyContent: 'space-between' }}>
+                  <span>Custom Wake Word / Phrase:</span>
+                  <span style={{ fontSize: 10, color: 'var(--accent)' }}>Active: “{wakeWord}”</span>
+                </label>
+                <form
+                  className="ai-wake-input-row"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleSaveWakeWord(customWakeInput);
+                  }}
+                >
+                  <input
+                    className="ai-wake-text-input"
+                    value={customWakeInput}
+                    onChange={(e) => setCustomWakeInput(e.target.value)}
+                    placeholder="Type custom phrase (e.g. Jarvis, Computer, Assistant)…"
+                    autoFocus
+                  />
+                  <button
+                    type="submit"
+                    className="pill primary"
+                    style={{ padding: '7px 16px', fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap' }}
+                  >
+                    <i className="ti ti-check" style={{ marginRight: 3 }} /> Save
+                  </button>
+                </form>
+              </div>
+
+              {/* One-Click Presets */}
+              <div className="ai-wake-form-group">
+                <label style={{ fontSize: 11, fontWeight: 700, color: '#f4f4f5' }}>
+                  Quick Presets (Click to set immediately):
+                </label>
+                <div className="ai-wake-presets">
+                  {['Planner', 'Hey Planner', 'Jarvis', 'Assistant', 'Computer', 'Study', 'Friday', 'Alex'].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      className={`ai-wake-preset-btn ${wakeWord.toLowerCase() === preset.toLowerCase() ? 'active' : ''}`}
+                      onClick={() => {
+                        setCustomWakeInput(preset);
+                        handleSaveWakeWord(preset);
+                      }}
+                    >
+                      {wakeWord.toLowerCase() === preset.toLowerCase() && <i className="ti ti-check" style={{ marginRight: 3 }} />}
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Sensitivity & Test Activation Row */}
+              <div className="ai-wake-row-options">
+                <div className="ai-wake-mini-option">
+                  <label>Pronunciation / Accents</label>
+                  <select
+                    className="ai-wake-mini-select"
+                    value={wakeSensitivity}
+                    onChange={(e) => {
+                      setWakeSensitivity(e.target.value);
+                      localStorage.setItem('planner_wake_sensitivity', e.target.value);
+                      setFeedback({ message: `Sensitivity: ${e.target.value === 'high' ? 'Smart (Catches Accents)' : 'Strict'}` });
+                      if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+                      feedbackTimerRef.current = setTimeout(() => setFeedback(null), 2000);
+                    }}
+                  >
+                    <option value="high">Smart (Tolerates Accents)</option>
+                    <option value="strict">Strict (Exact Match Only)</option>
+                  </select>
+                </div>
+
+                <div className="ai-wake-mini-option">
+                  <label>Test Activation</label>
+                  <button
+                    type="button"
+                    className="pill"
+                    style={{ padding: '4px 8px', fontSize: 11, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
+                    onClick={testWakeWordActivation}
+                    title="Simulate speaking the wake word"
+                  >
+                    <i className="ti ti-bolt" style={{ color: '#eab308' }} /> Test “{wakeWord}”
+                  </button>
+                </div>
+              </div>
+
+              {/* Reset to Default and Switch back to Controller */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: 6, borderTop: '1px solid #27272a' }}>
+                <button
+                  type="button"
+                  className="muted"
+                  style={{ fontSize: 11, cursor: 'pointer', background: 'none', border: 'none' }}
+                  onClick={() => {
+                    handleSaveWakeWord('Planner');
+                  }}
+                >
+                  Reset to "Planner"
+                </button>
+                <button
+                  type="button"
+                  className="pill"
+                  style={{ padding: '5px 14px', fontSize: 11, fontWeight: 600 }}
+                  onClick={() => setHudTab('assistant')}
+                >
+                  ← Back to Voice Controller
+                </button>
+              </div>
+            </div>
+          ) : (
+            /* TAB 2: VOICE CONTROLLER ASSISTANT VIEW */
+            <>
+              {/* Quick Wake Word Strip on Assistant Tab */}
+              <div className="ai-wake-quick-strip">
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                  <span className={`ai-wake-status-dot ${alwaysListen ? 'pulsing' : ''}`} style={{ background: alwaysListen ? '#22c55e' : '#71717a' }} />
+                  Wake Word: <b style={{ color: 'var(--accent)' }}>“{wakeWord}”</b>
+                </span>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    className="pill primary"
+                    style={{ padding: '3px 10px', fontSize: 11, fontWeight: 600 }}
+                    onClick={() => setHudTab('wake_settings')}
+                    title="Change wake word or adjust phrase presets"
+                  >
+                    <i className="ti ti-adjustments-horizontal" style={{ marginRight: 3 }} /> Wake Word Settings
+                  </button>
+                </div>
+              </div>
+
+          {/* Microphone Device Selection */}
+          <div className="ai-mic-select-container">
+            <span className="ai-mic-select-label">
+              <i className="ti ti-microphone" /> Mic Input:
+            </span>
+            <select
+              className="ai-mic-dropdown"
+              value={selectedDeviceId}
+              onChange={(e) => handleDeviceChange(e.target.value)}
+              title="Select which microphone to record from"
+            >
+              <option value="">Default Microphone</option>
+              {audioDevices.map((d, idx) => (
+                <option key={d.deviceId || idx} value={d.deviceId}>
+                  {d.label || `Microphone ${idx + 1}`}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Live Mic Reception Checker & Voice Indicator */}
+          <div className="ai-mic-reception-card">
+            <div className="ai-mic-status-row">
+              <span
+                className={`ai-mic-badge ${
+                  voiceDetected
+                    ? 'active'
+                    : hasReceivedSound
+                    ? 'active'
+                    : silenceDuration > 2.5
+                    ? 'silent'
+                    : 'waiting'
+                }`}
+              >
+                <i
+                  className={`ti ${
+                    voiceDetected
+                      ? 'ti-microphone'
+                      : silenceDuration > 2.5
+                      ? 'ti-microphone-off'
+                      : 'ti-waveform'
+                  }`}
+                />
+                {voiceDetected
+                  ? 'Voice Detected & Receiving'
+                  : hasReceivedSound
+                  ? 'Voice Audio Received'
+                  : silenceDuration > 2.5
+                  ? 'No Sound (Mic Muted/Silent)'
+                  : listening
+                  ? 'Listening (speak now)…'
+                  : 'Ready to listen'}
+              </span>
+              <span className="ai-mic-vol-label">{audioLevel}% level</span>
+            </div>
+
+            {/* Dynamic visualizer bars jumping to real frequencies */}
+            <div
+              className="ai-waveform-container"
+              title={`Live microphone input: ${audioLevel}%`}
+            >
+              {frequencies.map((h, idx) => (
+                <div
+                  key={idx}
+                  className={`ai-wave-bar ${
+                    voiceDetected ? 'speaking' : h > 4 ? '' : 'silent'
+                  }`}
+                  style={{ height: `${h}px` }}
+                />
+              ))}
+            </div>
+
+            {/* Live Volume VU bar */}
+            <div
+              className="ai-vu-bar-bg"
+              title={`Live input volume: ${audioLevel}%`}
+            >
+              <div
+                className="ai-vu-bar-fill"
+                style={{
+                  width: `${Math.max(audioLevel > 0 ? 6 : 0, audioLevel)}%`,
+                }}
+              />
+            </div>
+
+            {/* Helpful warning if mic volume stays 0% */}
+            {silenceDuration > 3 && !hasReceivedSound && listening && (
+              <div className="ai-mic-silent-warning">
+                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or switch mic above.
+              </div>
+            )}
+          </div>
+
+          {/* Real-Time Actively Written Transcription Box */}
+          <div className={`ai-active-transcription-card ${listening ? 'recording' : ''}`}>
+            <div className="ai-active-header">
+              <span>
+                <span className="ai-active-live-dot" style={{ opacity: listening ? 1 : 0.4 }} />
+                Actively Writing Speech
+              </span>
+              <span style={{ color: voiceDetected ? '#4ade80' : 'var(--muted)', fontWeight: 600 }}>
+                {voiceDetected ? '🟢 Hearing Voice...' : listening ? '🎙️ Speak Now' : 'Idle'}
+              </span>
+            </div>
+            <div className={`ai-active-text ${!transcript && !manualCmd ? 'placeholder' : ''}`}>
+              {transcript ||
+                manualCmd ||
+                (listening
+                  ? voiceDetected
+                    ? '🟢 Hearing your voice... Transcribing...'
+                    : 'Speak now: "Go to Calendar", "Add Optics to Lectures", "Mark optics done", "Wallpaper dusk"…'
+                  : 'Click "Speak Command" below or hold the toggle to talk…')}
+              {listening && <span className="ai-blinking-cursor">|</span>}
+            </div>
+          </div>
+
+          {/* Action Buttons & Undo/Redo */}
+          <div className="ai-live-actions">
+            {listening ? (
+              <>
+                <button
+                  type="button"
+                  className="pill primary"
+                  style={{ padding: '5px 14px', fontSize: 12, fontWeight: 600 }}
+                  onClick={() => handleDoneAndRun()}
+                >
+                  Done & Run
+                </button>
+                <button
+                  type="button"
+                  className="muted"
+                  style={{ fontSize: 12, padding: '5px 10px' }}
+                  onClick={cancelListening}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="pill primary"
+                style={{ padding: '6px 14px', fontSize: 12, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                onClick={startListening}
+              >
+                <i className="ti ti-microphone" /> Speak Command
+              </button>
+            )}
+
+            <div className="undo-redo-group" style={{ marginLeft: 'auto' }}>
+              <button
+                type="button"
+                className="undo-redo-btn"
+                disabled={!canUndo}
+                onClick={async () => {
+                  if (onUndo) {
+                    const desc = await onUndo();
+                    setFeedback({ message: desc ? `↩ Undone: ${desc}` : 'Nothing to undo' });
+                  }
+                }}
+                title="Undo last action (Ctrl+Z)"
+              >
+                <i className="ti ti-arrow-back-up" /> Undo
+              </button>
+              <button
+                type="button"
+                className="undo-redo-btn"
+                disabled={!canRedo}
+                onClick={async () => {
+                  if (onRedo) {
+                    const desc = await onRedo();
+                    setFeedback({ message: desc ? `↪ Redone: ${desc}` : 'Nothing to redo' });
+                  }
+                }}
+                title="Redo action (Ctrl+Y)"
+              >
+                <i className="ti ti-arrow-forward-up" /> Redo
+              </button>
+            </div>
+
+            <button
+              type="button"
+              className="muted"
+              style={{ fontSize: 11, padding: '4px 8px' }}
+              onClick={toggleTestMic}
+              title="Test microphone input level"
+            >
+              <i className="ti ti-tool" style={{ marginRight: 3 }} /> Test Mic
+            </button>
+          </div>
+
+          {/* Real-time editable command form */}
+          <form
+            style={{ display: 'flex', gap: 6, marginTop: 2 }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const cmd = (manualCmd || transcript).trim();
+              if (cmd) {
+                cancelListening();
+                executeVoiceCommand(cmd);
+              }
+            }}
+          >
+            <input
+              value={manualCmd || transcript}
+              onChange={(e) => {
+                setManualCmd(e.target.value);
+                setTranscript(e.target.value);
+              }}
+              placeholder="Type or edit command to execute…"
+              style={{ flex: 1, padding: '6px 9px', fontSize: 12, borderRadius: 8, background: '#1c1c20', color: '#fff', border: '1px solid #3f3f46' }}
+            />
+            <button type="submit" className="pill" style={{ padding: '6px 12px', fontSize: 11 }}>
+              Execute
+            </button>
+          </form>
+        </>
+      )}
+    </div>
+  )}
+
+      {/* Dedicated Mic Tester HUD */}
+      {isTestingMic && !listening && (
+        <div className="ai-voice-live-hud">
+          <div className="ai-listening-indicator">
+            <span
+              className="ai-dot-pulse"
+              style={{ background: voiceDetected ? '#22c55e' : '#eab308' }}
+            />
+            <b>Microphone Input Test & Device Selector</b>
+          </div>
+
+          {/* Microphone Selector Dropdown in Tester */}
+          <div className="ai-mic-select-container">
+            <span className="ai-mic-select-label">
+              <i className="ti ti-microphone" /> Switch Mic:
+            </span>
+            <select
+              className="ai-mic-dropdown"
+              value={selectedDeviceId}
+              onChange={(e) => handleDeviceChange(e.target.value)}
+              title="Select which microphone to test"
+            >
+              <option value="">Default Microphone</option>
+              {audioDevices.map((d, idx) => (
+                <option key={d.deviceId || idx} value={d.deviceId}>
+                  {d.label || `Microphone ${idx + 1}`}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="ai-mic-reception-card">
+            <div className="ai-mic-status-row">
+              <span
+                className={`ai-mic-badge ${
+                  voiceDetected
+                    ? 'active'
+                    : hasReceivedSound
+                    ? 'active'
+                    : silenceDuration > 2.5
+                    ? 'silent'
+                    : 'waiting'
+                }`}
+              >
+                <i
+                  className={`ti ${
+                    voiceDetected
+                      ? 'ti-microphone'
+                      : silenceDuration > 2.5
+                      ? 'ti-microphone-off'
+                      : 'ti-waveform'
+                  }`}
+                />
+                {voiceDetected
+                  ? 'Voice Detected & Receiving'
+                  : hasReceivedSound
+                  ? 'Voice Audio Received'
+                  : silenceDuration > 2.5
+                  ? 'No Sound (Mic Muted/Silent)'
+                  : 'Speak to test mic…'}
+              </span>
+              <span className="ai-mic-vol-label">{audioLevel}% level</span>
+            </div>
+
+            <div className="ai-waveform-container" title={`Live level: ${audioLevel}%`}>
+              {frequencies.map((h, idx) => (
+                <div
+                  key={idx}
+                  className={`ai-wave-bar ${
+                    voiceDetected ? 'speaking' : h > 4 ? '' : 'silent'
+                  }`}
+                  style={{ height: `${h}px` }}
+                />
+              ))}
+            </div>
+
+            <div className="ai-vu-bar-bg" title={`Live input volume: ${audioLevel}%`}>
+              <div
+                className="ai-vu-bar-fill"
+                style={{
+                  width: `${Math.max(audioLevel > 0 ? 6 : 0, audioLevel)}%`,
+                }}
+              />
+            </div>
+
+            {silenceDuration > 3 && !hasReceivedSound && (
+              <div className="ai-mic-silent-warning">
+                ⚠️ <b>Mic is silent (0% input).</b> Check if your physical microphone is muted or switch to another mic above.
+              </div>
+            )}
+          </div>
+
+          <div className="ai-live-actions" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontSize: 12, color: voiceDetected ? '#4ade80' : 'var(--muted)' }}>
+              {voiceDetected ? '🟢 Receiving voice input!' : 'Speak into mic to test reception'}
+            </span>
+            <button
+              type="button"
+              className="pill"
+              style={{ padding: '5px 12px', fontSize: 12 }}
+              onClick={toggleTestMic}
+            >
+              Close Test
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Analyzing state banner */}
+      {analyzing && (
+        <div className="ai-voice-live-hud analyzing">
+          <div className="ai-analyzing-content">
+            <i className="ti ti-sparkles ai-spin" style={{ color: 'var(--accent)', fontSize: 20 }} />
+            <span>Executing action…</span>
+          </div>
+        </div>
+      )}
+
+      {/* Feedback Toast */}
+      {feedback && (
+        <div className="ai-voice-live-hud feedback">
+          <div className="ai-feedback-header">
+            <i className="ti ti-circle-check-filled" style={{ color: '#22c55e', fontSize: 20 }} />
+            <span className="ai-feedback-text">{feedback.message}</span>
+            <button
+              type="button"
+              className="x"
+              style={{ marginLeft: 'auto', padding: 2 }}
+              onClick={() => setFeedback(null)}
+            >
+              <i className="ti ti-x" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Error message */}
+      {error && (
+        <div className="ai-voice-live-hud error">
+          <i className="ti ti-alert-triangle" style={{ fontSize: 18 }} />
+          <span>{error}</span>
+          <button type="button" className="x" style={{ marginLeft: 'auto' }} onClick={() => setError('')}>
+            <i className="ti ti-x" />
+          </button>
+        </div>
+      )}
+
+      {/* Floating Assistant Wake Word Activation Banner */}
+      {wakeActivated && (
+        <div className="ai-wake-banner">
+          <span className="ai-wake-dot" />
+          <span>“{wakeWord}” detected! Listening…</span>
+        </div>
+      )}
+
+      {/* Cancel button that shows up while processing or capturing voice, positioned just adjacent */}
+      {(analyzing || listening || isHolding) && (
+        <button
+          type="button"
+          className="ai-voice-cancel-btn"
+          onClick={handleCancelVoice}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+          }}
+          title="Cancel voice processing"
+          aria-label="Cancel voice processing"
+        >
+          <i className="ti ti-x" />
+          <span>Cancel</span>
+        </button>
+      )}
+
+      {/* Always-on Wake Word Status Badge (Adjacent to Mic) */}
+      <button
+        type="button"
+        className={`ai-wake-status-badge ${alwaysListen ? 'active' : ''}`}
+        onClick={handleToggleAlwaysListen}
+        title={alwaysListen ? `Listening for "${wakeWord}" (Click to pause)` : 'Always listening paused (Click to resume)'}
+      >
+        <span
+          className={`ai-wake-status-dot ${alwaysListen ? 'pulsing' : ''}`}
+          style={{ background: alwaysListen ? '#22c55e' : '#71717a' }}
+        />
+        <span>Listening: “{wakeWord}”</span>
+        <span style={{ opacity: 0.65, fontSize: 10, fontWeight: 700 }}>
+          {alwaysListen ? 'ON' : 'PAUSED'}
+        </span>
+      </button>
+
+      {/* SUITABLY ENLARGED FLOATING MIC TOGGLE (NO TEXT) IN BOTTOM RIGHT */}
+      <button
+        type="button"
+        id="ai-voice-fab"
+        className={`ai-fab-mic-btn ${(listening || isHolding) ? 'listening' : ''} ${isHolding ? 'holding' : ''} ${analyzing ? 'analyzing' : ''} ${wakeActivated ? 'wake-activated' : ''}`}
+        title={alwaysListen ? `Say "${wakeWord}" anytime, click once to open window, or hold to talk` : 'Click once to open window, or hold to record and speak'}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerCancelOrLeave}
+        onPointerCancel={handlePointerCancelOrLeave}
+        onContextMenu={(e) => e.preventDefault()}
+        disabled={analyzing}
+        aria-label="Voice Controller"
+      >
+        <div className="ai-fab-icon-wrap">
+          {analyzing ? (
+            <i className="ti ti-sparkles ai-spin" />
+          ) : (
+            <i className="ti ti-microphone" />
+          )}
+        </div>
+
+        {(listening || isHolding) && (
+          <span className="ai-fab-ripples">
+            <span className="ai-ripple-1" />
+            <span className="ai-ripple-2" />
+          </span>
+        )}
+      </button>
+
+      {/* Google Assistant Style Voice Match Setup / Training Modal */}
+      {showVoiceMatchModal && (
+        <div
+          className="voice-match-backdrop"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowVoiceMatchModal(false);
+          }}
+        >
+          <div className="voice-match-card">
+            {/* Top Close Button */}
+            <button
+              type="button"
+              className="ai-window-close"
+              style={{ position: 'absolute', top: 16, right: 16 }}
+              onClick={() => setShowVoiceMatchModal(false)}
+              title="Close setup"
+            >
+              <i className="ti ti-x" />
+            </button>
+
+            {trainingStep < 3 ? (
+              <>
+                <div className="voice-match-rings-wrap">
+                  <div className="voice-match-glow" />
+                  <div className={`voice-match-circle ${voiceDetected ? 'active' : ''}`}>
+                    <i className="ti ti-microphone" />
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gap: 4 }}>
+                  <h3 className="voice-match-title">Teach Assistant your voice</h3>
+                  <p className="voice-match-desc">
+                    Personalize your voice model so Planner responds whenever you say <b>“{wakeWord}”</b>.
+                  </p>
+                </div>
+
+                {/* Progress bar */}
+                <div className="voice-match-progress-bar-bg">
+                  <div
+                    className="voice-match-progress-bar-fill"
+                    style={{ width: `${(trainingStep / 3) * 100}%` }}
+                  />
+                </div>
+
+                {/* Step indicator badges */}
+                <div className="voice-match-steps-row">
+                  {[0, 1, 2].map((idx) => (
+                    <div
+                      key={idx}
+                      className={`voice-match-step-badge ${
+                        trainingStep > idx ? 'done' : trainingStep === idx ? 'current' : ''
+                      }`}
+                    >
+                      {trainingStep > idx ? <i className="ti ti-check" /> : idx + 1}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Active phrase to speak */}
+                <div className={`voice-match-phrase-box ${voiceDetected ? 'hearing' : ''}`}>
+                  <span className="voice-match-prompt-label">
+                    {getVoiceTrainingSteps(wakeWord)[trainingStep]?.title}
+                  </span>
+                  <span className="voice-match-prompt-text">
+                    {getVoiceTrainingSteps(wakeWord)[trainingStep]?.display}
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                    {getVoiceTrainingSteps(wakeWord)[trainingStep]?.sub}
+                  </span>
+                </div>
+
+                {/* Live wave visualizer & Real-time transcript */}
+                <div className="voice-match-live-indicator">
+                  <span style={{ color: voiceDetected ? '#4ade80' : 'var(--muted)' }}>
+                    {trainingLiveText
+                      ? `🟢 Heard: “${trainingLiveText}”`
+                      : voiceDetected
+                      ? '🟢 Hearing your voice…'
+                      : '🎙️ Speak the phrase aloud'}
+                  </span>
+                </div>
+                <div className="voice-match-wave-row">
+                  {frequencies.map((h, i) => (
+                    <div
+                      key={i}
+                      className="voice-match-wave-bar"
+                      style={{
+                        height: `${Math.max(4, h)}px`,
+                        background: voiceDetected ? '#4ade80' : 'var(--accent)',
+                      }}
+                    />
+                  ))}
+                </div>
+
+                <div className="voice-match-actions" style={{ flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="pill primary"
+                    style={{ padding: '8px 18px', fontSize: 13, fontWeight: 700 }}
+                    onClick={handleTrainingPhraseSpoken}
+                    title="Accept this phrase and advance"
+                  >
+                    <i className="ti ti-check" style={{ marginRight: 4 }} />
+                    Confirm Phrase
+                  </button>
+                  <button
+                    type="button"
+                    className="pill"
+                    style={{ padding: '8px 16px', fontSize: 12, fontWeight: 600 }}
+                    onClick={completeTrainingAndActivate}
+                    title="Skip remaining steps and enable immediately"
+                  >
+                    <i className="ti ti-bolt" style={{ color: '#eab308', marginRight: 4 }} />
+                    Skip & Enable
+                  </button>
+                  <button
+                    type="button"
+                    className="muted"
+                    style={{ fontSize: 11 }}
+                    onClick={() => {
+                      setShowVoiceMatchModal(false);
+                      setIsWindowOpen(true);
+                      setHudTab('wake_settings');
+                    }}
+                    title="Open Wake Word Settings menu in AI HUD"
+                  >
+                    <i className="ti ti-adjustments-horizontal" style={{ marginRight: 3 }} /> Change Phrase
+                  </button>
+                  <button
+                    type="button"
+                    className="muted"
+                    style={{ fontSize: 11 }}
+                    onClick={() => setShowVoiceMatchModal(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* Success screen */
+              <>
+                <div className="voice-match-success-icon">
+                  <i className="ti ti-check" />
+                </div>
+
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <h3 className="voice-match-title" style={{ color: '#4ade80' }}>
+                    Voice Match Ready!
+                  </h3>
+                  <p className="voice-match-desc">
+                    Your personalized voice model has been trained for <b>“{wakeWord}”</b>. Background listening is active.
+                  </p>
+                </div>
+
+                <div
+                  style={{
+                    background: '#1c1c22',
+                    padding: '12px 16px',
+                    borderRadius: 14,
+                    border: '1px solid #2e2e38',
+                    textAlign: 'left',
+                    display: 'grid',
+                    gap: 6,
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#f4f4f5' }}>
+                    <i className="ti ti-sparkles" style={{ color: 'var(--accent)' }} />
+                    <b>How it works:</b>
+                  </div>
+                  <div style={{ color: 'var(--muted)', lineHeight: 1.45 }}>
+                    • Say <b>“{wakeWord}”</b> anytime to activate listening.<br />
+                    • Or say <b>“{wakeWord}, add physics test tomorrow”</b> in one breath!<br />
+                    • You can change this phrase anytime in the AI HUD settings.
+                  </div>
+                </div>
+
+                <div className="voice-match-actions">
+                  <button
+                    type="button"
+                    className="pill primary"
+                    style={{ padding: '10px 24px', fontSize: 13, fontWeight: 700 }}
+                    onClick={completeTrainingAndActivate}
+                  >
+                    Activate “{wakeWord}” Assistant
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
